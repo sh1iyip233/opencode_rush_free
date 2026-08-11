@@ -1,10 +1,11 @@
 import { createRoot } from "react-dom/client";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
   CalendarRange,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleGauge,
@@ -15,6 +16,7 @@ import {
   ImageIcon,
   KeyRound,
   LogOut,
+  Menu,
   Network,
   Radio,
   RefreshCw,
@@ -28,7 +30,6 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
-import "./security.css";
 
 type Summary = {
   requests: number;
@@ -232,6 +233,11 @@ type UsageFilters = {
   customFrom: string;
   customTo: string;
 };
+type RefreshHandler = () => Promise<boolean>;
+type RegisterRefresh = (page: string, handler: RefreshHandler) => () => void;
+type RegisterChildRefresh = (handler: RefreshHandler) => () => void;
+
+const noopRegisterRefresh: RegisterRefresh = () => () => {};
 
 const alertEventOptions = [
   { value: "resin_unavailable", label: "Resin 不可达" },
@@ -256,10 +262,11 @@ const api = async (path: string, init: RequestInit = {}) => {
   if (!r.ok) throw new Error(data.error || "请求失败");
   return data;
 };
-const publicApi = async (path: string) => {
+const publicApi = async (path: string, init: RequestInit = {}) => {
   const r = await fetch(path, {
+    ...init,
     credentials: "omit",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(init.headers || {}) },
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || "状态数据暂时不可用");
@@ -612,35 +619,39 @@ function Console({
     active_proxies: 0,
   });
   const [models, setModels] = useState<Model[]>([]);
-  const [rows, setRows] = useState<RequestRow[]>([]);
   const [upstream, setUpstream] = useState<any>({});
-  const [proxyRefreshToken, setProxyRefreshToken] = useState(0);
-  const [usageRefreshToken, setUsageRefreshToken] = useState(0);
+  const [publicStatus, setPublicStatus] = useState<PublicStatusResponse | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const refreshHandlers = useRef(new Map<string, RefreshHandler>());
+  const overviewStatisticsRefresh = useRef<RefreshHandler | null>(null);
+  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const drawerCloseRef = useRef<HTMLButtonElement | null>(null);
+  const pageTitleRef = useRef<HTMLHeadingElement | null>(null);
   const load = useCallback(async () => {
     const results = await Promise.allSettled([
       api("/api/stats/summary"),
       api("/api/models/free"),
-      api("/api/usage/requests?limit=25"),
+      publicApi("/api/public/status", { cache: "no-store" }),
       api("/api/settings/upstream"),
     ]);
-    const [summaryResult, modelsResult, usageResult, upstreamResult] = results;
+    const [summaryResult, modelsResult, statusResult, upstreamResult] = results;
     if (summaryResult.status === "fulfilled") setSummary(summaryResult.value);
     if (modelsResult.status === "fulfilled") setModels(modelsResult.value);
-    if (usageResult.status === "fulfilled") setRows(usageResult.value);
+    if (statusResult.status === "fulfilled") setPublicStatus(statusResult.value);
     if (upstreamResult.status === "fulfilled") setUpstream(upstreamResult.value);
     const errors = results.filter((result) => result.status === "rejected") as PromiseRejectedResult[];
     if (errors.some((result) => (result.reason as Error).message === "AUTH")) {
       onLogout();
       return false;
-    } else if (errors.length) {
-      notify("部分控制台数据未能刷新", "warning");
-      return false;
     }
-    return true;
-  }, [notify, onLogout]);
+    return errors.length === 0;
+  }, [onLogout]);
   useEffect(() => {
-    void load();
-  }, [load]);
+    void load().then((ok) => {
+      if (!ok) notify("部分控制台数据未能刷新", "warning");
+    });
+  }, [load, notify]);
   useEffect(() => {
     const refreshWhenVisible = () => {
       if (page === "overview" && document.visibilityState === "visible") void load();
@@ -652,35 +663,105 @@ function Console({
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [load, page]);
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusFrame = window.requestAnimationFrame(() => drawerCloseRef.current?.focus());
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setDrawerOpen(false);
+        window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [drawerOpen]);
+  const registerRefresh = useCallback<RegisterRefresh>((pageName, handler) => {
+    refreshHandlers.current.set(pageName, handler);
+    return () => {
+      if (refreshHandlers.current.get(pageName) === handler) {
+        refreshHandlers.current.delete(pageName);
+      }
+    };
+  }, []);
   const nav = [
-    ["overview", "Overview", "仪表盘", CircleGauge],
-    ["proxies", "Proxy pool", "代理池", Network],
-    ["models", "Free models", "模型与网关", Database],
-    ["usage", "Usage log", "使用记录", Activity],
-    ["settings", "Settings", "设置", Settings2],
+    ["overview", "仪表盘", "Overview", "网关、模型与路径的实时运行状态", CircleGauge],
+    ["proxies", "代理池", "Proxy pool", "管理出口路径、路由策略与健康状态", Network],
+    ["models", "模型与网关", "Models", "配置上游、免费模型与客户端访问", Database],
+    ["usage", "使用记录", "Usage log", "按时间、模型和结果审计每次调用", Activity],
+    ["settings", "设置", "Settings", "管理安全、探测、告警与数据保留", Settings2],
   ] as const;
+  const currentPage = nav.find((item) => item[0] === page) || nav[0];
+  const navigate = (next: string) => {
+    setDrawerOpen(false);
+    setPage(next);
+    window.requestAnimationFrame(() => pageTitleRef.current?.focus());
+  };
+  const closeDrawer = () => {
+    setDrawerOpen(false);
+    window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+  };
+  const registerOverviewStatisticsRefresh = useCallback<RegisterChildRefresh>((handler) => {
+    overviewStatisticsRefresh.current = handler;
+    return () => {
+      if (overviewStatisticsRefresh.current === handler) {
+        overviewStatisticsRefresh.current = null;
+      }
+    };
+  }, []);
+  const refreshCurrentPage = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      let ok: boolean;
+      if (page === "overview") {
+        const [rootOK, statisticsOK] = await Promise.all([
+          load(),
+          overviewStatisticsRefresh.current?.() || Promise.resolve(true),
+        ]);
+        ok = rootOK && statisticsOK;
+      } else {
+        ok = await (refreshHandlers.current.get(page) || load)();
+      }
+      notify(ok ? "数据已刷新" : "部分数据未能刷新", ok ? "success" : "warning");
+    } catch (error) {
+      if ((error as Error).message === "AUTH") onLogout();
+      else notify((error as Error).message, "error");
+    } finally {
+      setRefreshing(false);
+    }
+  };
   return (
     <div className="app-shell">
-      <aside>
+      <aside id="console-navigation" className={drawerOpen ? "is-open" : ""} aria-label="控制台导航">
         <div className="brand">
           <div className="brand-icon">R</div>
           <div>
             <strong>Relay Desk</strong>
             <small>FREE MODEL GATEWAY</small>
           </div>
+          <button ref={drawerCloseRef} className="icon-btn drawer-close" type="button" aria-label="关闭导航" title="关闭导航" onClick={closeDrawer}>
+            <X size={17} />
+          </button>
         </div>
         <div className="nav-label">CONTROL ROOM</div>
         <nav>
-          {nav.map(([id, en, zh, Icon]) => (
+          {nav.map(([id, zh, en, , Icon]) => (
             <button
               key={id}
               className={page === id ? "active" : ""}
-              onClick={() => setPage(id)}
+              aria-current={page === id ? "page" : undefined}
+              onClick={() => navigate(id)}
             >
               <Icon size={17} />
               <span>
-                <b>{en}</b>
-                <small>{zh}</small>
+                <b>{zh}</b>
+                <small>{en}</small>
               </span>
               {page === id && <ChevronRight size={15} />}
             </button>
@@ -688,28 +769,44 @@ function Console({
         </nav>
         <div className="aside-note">
           <span className="pulse" />
-          Gateway online
+          网关在线
           <br />
-          <small>SQLite · encrypted secrets</small>
+          <small>SQLite · 密钥加密存储</small>
         </div>
         <button className="logout" onClick={onLogout}>
           <LogOut size={16} />
           退出
         </button>
       </aside>
+      {drawerOpen && <button className="drawer-backdrop" type="button" aria-label="关闭导航" onClick={closeDrawer} />}
       <main className="main">
-        <header>
-          <div>
+        <header className="console-header">
+          <div className="header-leading">
+            <button
+              ref={menuButtonRef}
+              className="icon-btn menu-button"
+              type="button"
+              aria-label="打开导航"
+              title="打开导航"
+              aria-controls="console-navigation"
+              aria-expanded={drawerOpen}
+              onClick={() => setDrawerOpen(true)}
+            >
+              <Menu size={18} />
+            </button>
+            <div className="header-copy">
             <div className="crumb">
               CONTROL ROOM <ChevronRight size={13} />{" "}
-              {nav.find((n) => n[0] === page)?.[1].toUpperCase()}
+              {currentPage[2].toUpperCase()}
             </div>
-            <h2>{nav.find((n) => n[0] === page)?.[2]}</h2>
+              <h1 ref={pageTitleRef} tabIndex={-1}>{currentPage[1]}</h1>
+              <p>{currentPage[3]}</p>
+            </div>
           </div>
           <div className="header-actions">
             <a className="console-status-link" href="/status" title="打开公开模型状态页">
               <Radio size={14} />
-              状态页
+              <span>状态页</span>
             </a>
             <span className="endpoint">
               <span className="dot green" /> :8080 /v1
@@ -717,26 +814,28 @@ function Console({
             <button
               className="icon-btn"
               title="刷新数据"
-              onClick={async () => {
-                const refreshed = await load();
-                setProxyRefreshToken((current) => current + 1);
-                setUsageRefreshToken((current) => current + 1);
-                if (refreshed) notify("数据已刷新");
-              }}
+              aria-label="刷新数据"
+              disabled={refreshing}
+              onClick={() => void refreshCurrentPage()}
             >
-              <RefreshCw size={17} />
+              <RefreshCw className={refreshing ? "spin" : ""} size={17} />
             </button>
           </div>
         </header>
         {page === "overview" && (
-          <Overview summary={summary} models={models} rows={rows} />
+          <Overview
+            summary={summary}
+            models={models}
+            status={publicStatus}
+            registerStatisticsRefresh={registerOverviewStatisticsRefresh}
+          />
         )}{" "}
         {page === "proxies" && (
           <Proxies
             upstream={upstream}
             reload={load}
             notify={notify}
-            refreshToken={proxyRefreshToken}
+            registerRefresh={registerRefresh}
           />
         )}{" "}
         {page === "models" && (
@@ -745,20 +844,21 @@ function Console({
             upstream={upstream}
             reload={load}
             notify={notify}
+            registerRefresh={registerRefresh}
           />
         )}{" "}
         {page === "usage" && (
           <Usage
             notify={notify}
             onLogout={onLogout}
-            refreshToken={usageRefreshToken}
+            registerRefresh={registerRefresh}
           />
         )}{" "}
         {page === "settings" && (
-          <SettingsPage notify={notify} onLogout={onLogout} />
+          <SettingsPage notify={notify} onLogout={onLogout} registerRefresh={registerRefresh} />
         )}{" "}
         {toast && (
-          <div className={`toast ${toast.type}`}>
+          <div className={`toast ${toast.type}`} role={toast.type === "error" ? "alert" : "status"}>
             {toast.type === "success" ? <Check size={15} /> : <TriangleAlert size={15} />}
             {toast.message}
           </div>
@@ -795,35 +895,52 @@ function Stat({
 function Overview({
   summary,
   models,
-  rows,
+  status,
+  registerStatisticsRefresh,
 }: {
   summary: Summary;
   models: Model[];
-  rows: RequestRow[];
+  status: PublicStatusResponse | null;
+  registerStatisticsRefresh: RegisterChildRefresh;
 }) {
-  const success = summary.success_rate * 100;
-  const countedRequests = summary.counted_requests || summary.requests;
-	const enabledModels = models.filter((model) => model.admin_enabled !== false);
+  const enabledModels = models.filter((model) => model.admin_enabled !== false);
+  const success24h = status?.models.reduce((total, model) => total + model.success_24h, 0) || 0;
+  const external24h = status?.models.reduce((total, model) => total + model.external_errors_24h, 0) || 0;
+  const counted24h = Math.max(0, (status?.summary.requests_24h || 0) - external24h);
+  const gatewayState = status?.summary.status || "no_request";
+  const gatewayLabel = status ? publicStatusLabels[gatewayState] : "状态未知";
+  const successLabel = status ? publicStatusRate(status.summary.success_rate) : "—";
   return (
     <div className="page">
-      <section className="hero-band">
-        <div>
-          <div className="eyebrow">实时网关监控</div>
-          <h1>
-            请求在流动。
-            <br />
-            <em>信号保持清晰。</em>
-          </h1>
-          <p>
-            一个安静、可追踪的 Free 模型通道。代理池负责路径，控制台负责判断。
-          </p>
+      <section className={`gateway-status-band ${gatewayState}`} aria-label="近 24 小时网关状态">
+        <div className="gateway-status-context">
+          <span className={`public-status-mark ${gatewayState}`} />
+          <div>
+            <span className="eyebrow">24H GATEWAY STATUS</span>
+            <strong>{gatewayLabel}</strong>
+            <small>
+              {status
+                ? `更新于 ${new Date(status.generated_at).toLocaleTimeString()}`
+                : "状态数据暂时不可用"}
+            </small>
+          </div>
         </div>
-        <div className="hero-orbit">
-          <div className="orbit-ring r1" />
-          <div className="orbit-ring r2" />
-          <div className="orbit-core">
-            <span className="pulse" />
-            在线
+        <div className="gateway-status-metrics">
+          <div>
+            <span>24h 成功率</span>
+            <strong>{successLabel}</strong>
+            <small>
+              {!status
+                ? "状态数据暂时不可用"
+                : status.summary.success_rate === null
+                ? "暂无有效请求"
+                : `${fmt(success24h)} / ${fmt(counted24h)} 有效请求`}
+            </small>
+          </div>
+          <div>
+            <span>24h 请求</span>
+            <strong>{status ? fmt(status.summary.requests_24h) : "—"}</strong>
+            <small>{fmt(external24h)} 次外部异常</small>
           </div>
         </div>
       </section>
@@ -852,73 +969,36 @@ function Overview({
           detail="参与轮换"
           accent="#5d78a4"
         />
-        <Stat
-          label="成功率"
-          value={`${success.toFixed(1)}%`}
-          detail={`${fmt(summary.success)} / ${fmt(countedRequests)} 有效请求成功`}
-          accent="#6d8b75"
-        />
       </section>
-      <DashboardStatistics />
-      <section className="two-col">
-        <div className="panel">
-          <div className="panel-head">
-            <div>
-              <span className="eyebrow">路由概览</span>
-              <h3>免费模型</h3>
-            </div>
-            <span className="count-chip">{enabledModels.length} 个可用</span>
+      <DashboardStatistics registerRefresh={registerStatisticsRefresh} />
+      <section className="panel free-models-panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">ROUTE DIRECTORY</span>
+            <h3>免费模型</h3>
+            <p className="muted">当前允许客户端调用的 Free 模型。</p>
           </div>
-          {enabledModels.length === 0 ? (
-            <Empty text="还没有可用的 Free 模型" />
-          ) : (
-            <div className="model-list">
-              {enabledModels.slice(0, 6).map((m) => (
-                <div className="model-row" key={m.model_id}>
-                  <span className="model-swatch">✦</span>
-                  <div>
-                    <b>{m.model_id}</b>
-                    <small>
-                      {m.free_reason.replaceAll("_", " ")} · 更新于{" "}
-                      {new Date(m.refreshed_at).toLocaleDateString()}
-                    </small>
-                  </div>
-                  <span className="status-tag">FREE</span>
-                </div>
-              ))}
-            </div>
-          )}
+          <span className="count-chip">{enabledModels.length} 个可用</span>
         </div>
-        <div className="panel">
-          <div className="panel-head">
-            <div>
-              <span className="eyebrow">最近流量</span>
-              <h3>最新请求</h3>
-            </div>
-            <span className="count-chip">显示 {rows.length} 条</span>
+        {enabledModels.length === 0 ? (
+          <Empty text="还没有可用的 Free 模型" />
+        ) : (
+          <div className="model-list model-list-wide">
+            {enabledModels.slice(0, 8).map((model) => (
+              <div className="model-row" key={model.model_id}>
+                <span className="model-swatch">✦</span>
+                <div>
+                  <b>{model.model_id}</b>
+                  <small>
+                    {model.free_reason.replaceAll("_", " ")} · 更新于{" "}
+                    {new Date(model.refreshed_at).toLocaleDateString()}
+                  </small>
+                </div>
+                <span className="status-tag">可用</span>
+              </div>
+            ))}
           </div>
-          {rows.length === 0 ? (
-            <Empty text="请求记录会出现在这里" />
-          ) : (
-            <div className="mini-table">
-              {rows.slice(0, 5).map((r) => (
-                <div className="mini-row" key={r.id}>
-                  <span
-                    className={`status-dot ${r.status === "success" ? "ok" : r.error_origin === "external" ? "neutral" : "bad"}`}
-                  />
-                  <div>
-                    <b>{r.model}</b>
-                    <small>
-                      {new Date(r.created_at).toLocaleTimeString()} ·{" "}
-                      {r.proxy_uri || "direct"}
-                    </small>
-                  </div>
-                  <strong>{r.total_tokens ? fmt(r.total_tokens) : "—"}</strong>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        )}
       </section>
     </div>
   );
@@ -931,7 +1011,7 @@ const statsWindows: Array<{ value: StatsWindow; label: string }> = [
   { value: "30d", label: "30 天" },
 ];
 
-function DashboardStatistics() {
+function DashboardStatistics({ registerRefresh }: { registerRefresh: RegisterChildRefresh }) {
   const initialWindow = new URLSearchParams(location.search).get("stats_window");
   const [windowName, setWindowName] = useState<StatsWindow>(
     statsWindows.some((option) => option.value === initialWindow) ? initialWindow as StatsWindow : "24h",
@@ -950,6 +1030,7 @@ function DashboardStatistics() {
     if (proxiesOK) setProxyStats(proxiesResult.value as DimensionStat[]);
     const failed = [modelsOK, proxiesOK].filter((ok) => !ok);
     setError(failed.length ? "部分维度统计暂时不可用" : "");
+    return failed.length === 0;
   }, [windowName]);
   useEffect(() => {
     const url = new URL(location.href);
@@ -957,6 +1038,7 @@ function DashboardStatistics() {
     history.replaceState(null, "", url);
     void load();
   }, [load, windowName]);
+  useEffect(() => registerRefresh(load), [load, registerRefresh]);
   useEffect(() => {
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") void load();
@@ -1007,12 +1089,12 @@ function Proxies({
   upstream,
   reload,
   notify,
-  refreshToken,
+  registerRefresh = noopRegisterRefresh,
 }: {
   upstream: any;
   reload: () => Promise<unknown>;
   notify: (v: string, type?: ToastType) => void;
-  refreshToken: number;
+  registerRefresh?: RegisterRefresh;
 }) {
   const [text, setText] = useState("");
   const [expiry, setExpiry] = useState("0");
@@ -1065,8 +1147,10 @@ function Proxies({
         setSelected((current) =>
           current.filter((id) => data.items.some((proxy) => proxy.id === id)),
         );
+        return true;
       } catch (e) {
         notify((e as Error).message, "error");
+        return false;
       } finally {
         setLoading(false);
       }
@@ -1081,14 +1165,25 @@ function Proxies({
       setResinPlatform(next.resin_platform || "Default");
       setResinToken("");
       setResinTokenDirty(false);
+      return true;
     } catch (e) {
       notify((e as Error).message, "error");
+      return false;
     }
   }, [notify]);
+  const refreshAll = useCallback(async () => {
+    const results = await Promise.all([
+      reload(),
+      loadProxies(proxyPage, pageSize),
+      loadEngine(),
+    ]);
+    return results[1] && results[2] && results[0] !== false;
+  }, [loadEngine, loadProxies, pageSize, proxyPage, reload]);
+  useEffect(() => registerRefresh("proxies", refreshAll), [refreshAll, registerRefresh]);
   useEffect(() => {
     void loadProxies(proxyPage, pageSize);
     void loadEngine();
-  }, [loadEngine, loadProxies, pageSize, proxyPage, refreshToken]);
+  }, [loadEngine, loadProxies, pageSize, proxyPage]);
   useEffect(
     () => setSessionLimit(String(upstream.session_proxy_request_limit ?? 50)),
     [upstream.session_proxy_request_limit],
@@ -1253,7 +1348,7 @@ function Proxies({
       setResinTokenDirty(false);
       setResinResult(null);
       await reload();
-      notify(nextEngine === "resin" ? "Resin gateway enabled" : "Built-in pool enabled");
+      notify(nextEngine === "resin" ? "已启用 Resin 网关" : "已启用内置代理池");
     } catch (e) {
       notify((e as Error).message, "error");
     } finally {
@@ -1267,7 +1362,7 @@ function Proxies({
       setResinResult(result);
       await loadEngine();
       await reload();
-      notify("Resin gateway test passed");
+      notify("Resin 网关测试通过");
     } catch (e) {
       setResinResult({ ok: false, error: (e as Error).message });
       notify((e as Error).message, "error");
@@ -1285,33 +1380,22 @@ function Proxies({
   };
   return (
     <div className="page">
-      <div className="page-intro">
-        <div>
-          <div className="eyebrow">NETWORK PATHS</div>
-          <h1>代理池</h1>
-          <p>用多条路径保持模型请求的可达性。支持 HTTP、HTTPS 与 SOCKS5。</p>
-        </div>
-        <div className="big-number">
-          <strong>{fmt(total)}</strong>
-          <small>managed paths</small>
-        </div>
-      </div>
       <section className="panel engine-panel">
         <div className="panel-head">
           <div>
             <div className="eyebrow">ROUTE ENGINE</div>
-            <h3>Node pool engine</h3>
+            <h3>路由引擎</h3>
           </div>
           <Network size={20} />
         </div>
-        <div className="segmented" role="group" aria-label="Node pool engine">
+        <div className="segmented" role="group" aria-label="路由引擎">
           <button
             type="button"
             className={engineConfig.engine === "builtin" ? "active" : ""}
             disabled={busy}
             onClick={() => void saveEngine("builtin")}
           >
-            Built-in pool
+            内置代理池
           </button>
           <button
             type="button"
@@ -1322,14 +1406,14 @@ function Proxies({
               setEngineConfig((current) => ({ ...current, engine: "resin" }));
             }}
           >
-            Resin gateway
+            Resin 网关
           </button>
         </div>
         {engineConfig.engine === "resin" && (
           <div className="resin-config">
             <div className="config-grid">
               <label>
-                Resin gateway URL
+                Resin 网关 URL
                 <input
                   value={resinGatewayURL}
                   onChange={(event) => setResinGatewayURL(event.target.value)}
@@ -1338,7 +1422,7 @@ function Proxies({
                 />
               </label>
               <label>
-                Platform
+                平台
                 <input
                   value={resinPlatform}
                   onChange={(event) => setResinPlatform(event.target.value)}
@@ -1347,7 +1431,7 @@ function Proxies({
                 />
               </label>
               <label className="resin-token-field">
-                Proxy token
+                代理令牌
                 <input
                   type="password"
                   value={resinToken}
@@ -1355,7 +1439,7 @@ function Proxies({
                     setResinToken(event.target.value);
                     setResinTokenDirty(true);
                   }}
-                  placeholder={engineConfig.has_resin_proxy_token ? "Stored securely" : "Optional when Resin auth is disabled"}
+                  placeholder={engineConfig.has_resin_proxy_token ? "已安全保存" : "Resin 未启用认证时可留空"}
                   autoComplete="new-password"
                 />
               </label>
@@ -1363,10 +1447,10 @@ function Proxies({
             <div className="config-actions">
               <button className="primary" type="button" disabled={busy} onClick={() => void saveEngine("resin")}>
                 <Network size={16} />
-                Save Resin
+                保存 Resin 配置
               </button>
               <button className="secondary" type="button" disabled={busy || !engineConfig.resin_configured} onClick={() => void testResin()}>
-                Test gateway
+                测试网关
               </button>
             </div>
             <div className={`resin-state ${engineConfig.resin_health === "degraded" ? "error-line" : "muted"}`}>
@@ -1376,7 +1460,7 @@ function Proxies({
             </div>
             {resinResult && (
               <div className={`test-result ${resinResult.ok ? "ok" : "bad"}`}>
-                {resinResult.ok ? "Gateway ready" : resinResult.error || "Gateway test failed"}
+                {resinResult.ok ? "网关可用" : resinResult.error || "网关测试失败"}
               </div>
             )}
           </div>
@@ -1665,7 +1749,13 @@ function Proxies({
   );
 }
 
-function ClientKeysPanel({ notify }: { notify: (value: string, type?: ToastType) => void }) {
+function ClientKeysPanel({
+  notify,
+  registerRefresh,
+}: {
+  notify: (value: string, type?: ToastType) => void;
+  registerRefresh?: RegisterChildRefresh;
+}) {
   const [keys, setKeys] = useState<ClientKey[]>([]);
   const [name, setName] = useState("");
   const [rpm, setRPM] = useState("0");
@@ -1676,11 +1766,14 @@ function ClientKeysPanel({ notify }: { notify: (value: string, type?: ToastType)
   const load = useCallback(async () => {
     try {
       setKeys((await api("/api/client-keys")) as ClientKey[]);
+      return true;
     } catch (error) {
       notify((error as Error).message, "error");
+      return false;
     }
   }, [notify]);
   useEffect(() => void load(), [load]);
+  useEffect(() => registerRefresh?.(load), [load, registerRefresh]);
   const create = async () => {
     const rpmLimit = Number(rpm);
     const tpmLimit = Number(tpm);
@@ -1753,12 +1846,29 @@ function ClientKeysPanel({ notify }: { notify: (value: string, type?: ToastType)
   </section>;
 }
 
-function ModelAliasesPanel({ models, notify }: { models: Model[]; notify: (value: string, type?: ToastType) => void }) {
+function ModelAliasesPanel({
+  models,
+  notify,
+  registerRefresh,
+}: {
+  models: Model[];
+  notify: (value: string, type?: ToastType) => void;
+  registerRefresh?: RegisterChildRefresh;
+}) {
   const [aliases, setAliases] = useState<ModelAlias[]>([]);
   const [alias, setAlias] = useState("");
   const [target, setTarget] = useState("");
-  const load = useCallback(async () => { try { setAliases((await api("/api/model-aliases")) as ModelAlias[]); } catch (error) { notify((error as Error).message, "error"); } }, [notify]);
+  const load = useCallback(async () => {
+    try {
+      setAliases((await api("/api/model-aliases")) as ModelAlias[]);
+      return true;
+    } catch (error) {
+      notify((error as Error).message, "error");
+      return false;
+    }
+  }, [notify]);
   useEffect(() => void load(), [load]);
+  useEffect(() => registerRefresh?.(load), [load, registerRefresh]);
   const create = async () => {
     try { await api("/api/model-aliases", { method: "POST", body: JSON.stringify({ alias, target_model_id: target }) }); setAlias(""); await load(); notify("模型别名已保存"); } catch (error) { notify((error as Error).message, "error"); }
   };
@@ -1774,11 +1884,13 @@ function Models({
   upstream,
   reload,
   notify,
+  registerRefresh = noopRegisterRefresh,
 }: {
   models: Model[];
   upstream: any;
-  reload: () => void;
+  reload: () => Promise<unknown>;
   notify: (v: string, type?: ToastType) => void;
+  registerRefresh?: RegisterRefresh;
 }) {
   const [base, setBase] = useState(upstream.base_url || "");
   const [key, setKey] = useState("");
@@ -1794,6 +1906,7 @@ function Models({
   const [clientKey, setClientKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
+  const childRefreshers = useRef(new Set<RefreshHandler>());
   useEffect(() => {
     setBase(upstream.base_url || "");
     setVisionBase(upstream.vision_base_url || "");
@@ -1807,6 +1920,18 @@ function Models({
     upstream.vision_model,
     upstream.vision_use_proxy,
   ]);
+  const registerChildRefresh = useCallback<RegisterChildRefresh>((handler) => {
+    childRefreshers.current.add(handler);
+    return () => childRefreshers.current.delete(handler);
+  }, []);
+  const refreshSavedData = useCallback(async () => {
+    const results = await Promise.all([
+      reload(),
+      ...Array.from(childRefreshers.current, (refresh) => refresh()),
+    ]);
+    return results.every((result) => result !== false);
+  }, [reload]);
+  useEffect(() => registerRefresh("models", refreshSavedData), [refreshSavedData, registerRefresh]);
   const save = async () => {
     let customHeaders: Record<string, string>;
     try {
@@ -1905,12 +2030,7 @@ function Models({
   };
   return (
     <div className="page">
-      <div className="page-intro">
-        <div>
-          <div className="eyebrow">MODEL DIRECTORY</div>
-          <h1>模型与网关</h1>
-          <p>从上游拉取模型，只把真正免费的路径交给客户端。</p>
-        </div>
+      <div className="page-actions">
         <button className="primary" onClick={refresh} disabled={busy}>
           <RefreshCw size={16} />
           {busy ? "刷新中…" : "刷新模型"}
@@ -2093,21 +2213,21 @@ function Models({
       <section className="panel">
         <div className="panel-head">
           <div>
-            <h3>Free 模型</h3>
+            <h3>免费模型</h3>
             <p className="muted">
               {upstream.last_model_refresh_at
                 ? `最近刷新 ${new Date(upstream.last_model_refresh_at).toLocaleString()}`
                 : "尚未刷新"}
             </p>
           </div>
-          <span className="count-chip">{models.length} available</span>
+          <span className="count-chip">{models.length} 个模型</span>
         </div>
         <div className="model-grid">
           {models.map((m) => (
             <div className="model-card" key={m.model_id}>
               <div className="model-card-top">
                 <span className="model-swatch">✦</span>
-                <button className={m.admin_enabled === false ? "status-tag muted-tag" : "status-tag"} onClick={() => void setModelEnabled(m)} title={m.admin_enabled === false ? "启用模型" : "停用模型"}>{m.admin_enabled === false ? "OFF" : "FREE"}</button>
+                <button className={m.admin_enabled === false ? "status-tag muted-tag" : "status-tag"} onClick={() => void setModelEnabled(m)} title={m.admin_enabled === false ? "启用模型" : "停用模型"}>{m.admin_enabled === false ? "已停用" : "可用"}</button>
               </div>
               <b>{m.model_id}</b>
               <small>{m.display_name}</small>
@@ -2119,8 +2239,8 @@ function Models({
           {models.length === 0 && <Empty text="刷新上游以发现 Free 模型" />}
         </div>
       </section>
-      <ModelAliasesPanel models={models} notify={notify} />
-      <ClientKeysPanel notify={notify} />
+      <ModelAliasesPanel models={models} notify={notify} registerRefresh={registerChildRefresh} />
+      <ClientKeysPanel notify={notify} registerRefresh={registerChildRefresh} />
     </div>
   );
 }
@@ -2187,19 +2307,32 @@ function PasswordCard({ notify }: { notify: (v: string, type?: ToastType) => voi
   );
 }
 
-function OperationsSettings({ notify }: { notify: (value: string, type?: ToastType) => void }) {
+function OperationsSettings({
+  notify,
+  registerRefresh,
+}: {
+  notify: (value: string, type?: ToastType) => void;
+  registerRefresh: RegisterChildRefresh;
+}) {
   const [probes, setProbes] = useState<ProbeSettings>({ enabled: true, exit_minutes: 15, upstream_minutes: 60 });
   const [alerts, setAlerts] = useState<AlertSettings>({ enabled: false, webhook_url: "", has_webhook_secret: false, events: alertEventOptions.map((event) => event.value), low_proxy_threshold: 3, success_rate_percent: 80 });
   const [refreshMinutes, setRefreshMinutes] = useState(360);
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    Promise.allSettled([api("/api/settings/probes"), api("/api/settings/alerts"), api("/api/settings/model-refresh")]).then(([probeResult, alertResult, refreshResult]) => {
+  const load = useCallback(async () => {
+    const results = await Promise.allSettled([
+      api("/api/settings/probes"),
+      api("/api/settings/alerts"),
+      api("/api/settings/model-refresh"),
+    ]);
+    const [probeResult, alertResult, refreshResult] = results;
       if (probeResult.status === "fulfilled") setProbes(probeResult.value as ProbeSettings);
       if (alertResult.status === "fulfilled") setAlerts(alertResult.value as AlertSettings);
       if (refreshResult.status === "fulfilled") setRefreshMinutes(refreshResult.value.refresh_minutes);
-    });
+    return results.every((result) => result.status === "fulfilled");
   }, []);
+  useEffect(() => void load(), [load]);
+  useEffect(() => registerRefresh(load), [load, registerRefresh]);
   const save = async () => {
     setBusy(true);
     try {
@@ -2240,31 +2373,46 @@ function OperationsSettings({ notify }: { notify: (value: string, type?: ToastTy
 function SettingsPage({
   notify,
   onLogout,
+  registerRefresh,
 }: {
   notify: (value: string, type?: ToastType) => void;
   onLogout: () => void;
+  registerRefresh: RegisterRefresh;
 }) {
   const [retentionDays, setRetentionDays] = useState(90);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const childRefreshers = useRef(new Set<RefreshHandler>());
 
-  useEffect(() => {
-    let active = true;
-    api("/api/settings/usage-retention")
-      .then((data) => {
-        if (active) setRetentionDays(data.usage_retention_days);
-      })
-      .catch((error) => {
-        if ((error as Error).message === "AUTH") onLogout();
-        else notify((error as Error).message, "error");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
+  const loadRetention = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api("/api/settings/usage-retention");
+      setRetentionDays(data.usage_retention_days);
+      return true;
+    } catch (error) {
+      if ((error as Error).message === "AUTH") onLogout();
+      else notify((error as Error).message, "error");
+      return false;
+    } finally {
+      setLoading(false);
+    }
   }, [notify, onLogout]);
+  useEffect(() => {
+    void loadRetention();
+  }, [loadRetention]);
+  const registerChildRefresh = useCallback<RegisterChildRefresh>((handler) => {
+    childRefreshers.current.add(handler);
+    return () => childRefreshers.current.delete(handler);
+  }, []);
+  const refreshSettings = useCallback(async () => {
+    const results = await Promise.all([
+      loadRetention(),
+      ...Array.from(childRefreshers.current, (refresh) => refresh()),
+    ]);
+    return results.every(Boolean);
+  }, [loadRetention]);
+  useEffect(() => registerRefresh("settings", refreshSettings), [refreshSettings, registerRefresh]);
 
   const saveRetention = async () => {
     setSaving(true);
@@ -2285,15 +2433,8 @@ function SettingsPage({
 
   return (
     <div className="page">
-      <div className="page-intro">
-        <div>
-          <div className="eyebrow">CONSOLE SETTINGS</div>
-          <h1>设置</h1>
-          <p>管理控制台访问和使用记录保留策略。</p>
-        </div>
-      </div>
       <PasswordCard notify={notify} />
-      <OperationsSettings notify={notify} />
+      <OperationsSettings notify={notify} registerRefresh={registerChildRefresh} />
       <section className="panel retention-panel">
         <div className="panel-head">
           <div>
@@ -2376,11 +2517,11 @@ const formatDuration = (milliseconds?: number) => {
 function Usage({
   notify,
   onLogout,
-  refreshToken,
+  registerRefresh = noopRegisterRefresh,
 }: {
   notify: (value: string, type?: ToastType) => void;
   onLogout: () => void;
-  refreshToken: number;
+  registerRefresh?: RegisterRefresh;
 }) {
   const [rows, setRows] = useState<RequestRow[]>([]);
   const [models, setModels] = useState<string[]>([]);
@@ -2398,6 +2539,11 @@ function Usage({
     measured_at: "",
   });
   const [dailyUsage, setDailyUsage] = useState<DailyUsage[]>([]);
+  const [expandedRows, setExpandedRows] = useState<number[]>([]);
+  const notifyRef = useRef(notify);
+  useEffect(() => {
+    notifyRef.current = notify;
+  }, [notify]);
 
   const requestPath = useMemo(() => {
     const params = new URLSearchParams({
@@ -2420,37 +2566,36 @@ function Usage({
     if (appliedFilters.model) params.set("model", appliedFilters.model);
     if (appliedFilters.status) params.set("status", appliedFilters.status);
     return `/api/usage/requests?${params.toString()}`;
-  }, [appliedFilters, page, pageSize, refreshToken]);
+  }, [appliedFilters, page, pageSize]);
+
+  const loadRecords = useCallback(async (signal?: AbortSignal) => {
+    setLoading(true);
+    try {
+      const data = (await api(requestPath, { signal })) as UsagePage;
+      setRows(data.items);
+      setModels(data.models);
+      setTotal(data.total);
+      setTotalPages(data.total_pages);
+      setExpandedRows((current) => current.filter((id) => data.items.some((row) => row.id === id)));
+      if (data.page !== page) setPage(data.page);
+      return true;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") return false;
+      if ((error as Error).message === "AUTH") onLogout();
+      else notifyRef.current((error as Error).message, "error");
+      return false;
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, [onLogout, page, requestPath]);
 
   useEffect(() => {
     const controller = new AbortController();
-    let active = true;
-    setLoading(true);
-    api(requestPath, { signal: controller.signal })
-      .then((data: UsagePage) => {
-        if (!active) return;
-        setRows(data.items);
-        setModels(data.models);
-        setTotal(data.total);
-        setTotalPages(data.total_pages);
-        if (data.page !== page) setPage(data.page);
-      })
-      .catch((error) => {
-        if ((error as Error).name === "AbortError") return;
-        if ((error as Error).message === "AUTH") {
-          onLogout();
-          return;
-        }
-        notify((error as Error).message, "error");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
+    void loadRecords(controller.signal);
     return () => {
-      active = false;
       controller.abort();
     };
-  }, [requestPath]);
+  }, [loadRecords]);
 
   useEffect(() => {
     const url = new URL(location.href);
@@ -2468,41 +2613,54 @@ function Usage({
     history.replaceState(null, "", url);
   }, [appliedFilters, page, pageSize]);
 
-  useEffect(() => {
-    let active = true;
-    const loadRates = async () => {
-		if (document.visibilityState !== "visible") return;
-      try {
-        const data = (await api("/api/usage/rates")) as UsageRates;
-        if (active) setRates(data);
-      } catch (error) {
-        if ((error as Error).message === "AUTH") onLogout();
-      }
-    };
-    void loadRates();
-    const timer = window.setInterval(loadRates, 10_000);
-    document.addEventListener("visibilitychange", loadRates);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-		document.removeEventListener("visibilitychange", loadRates);
-    };
-  }, [refreshToken]);
+  const loadRates = useCallback(async (force = false) => {
+    if (!force && document.visibilityState !== "visible") return true;
+    try {
+      const data = (await api("/api/usage/rates")) as UsageRates;
+      setRates(data);
+      return true;
+    } catch (error) {
+      if ((error as Error).message === "AUTH") onLogout();
+      else if (force) notifyRef.current((error as Error).message, "error");
+      return false;
+    }
+  }, [onLogout]);
+
+  const loadDailyUsage = useCallback(async (reportError = true) => {
+    try {
+      setDailyUsage((await api("/api/stats/timeseries")) as DailyUsage[]);
+      return true;
+    } catch (error) {
+      if ((error as Error).message === "AUTH") onLogout();
+      else if (reportError) notifyRef.current((error as Error).message, "error");
+      return false;
+    }
+  }, [onLogout]);
 
   useEffect(() => {
-    let active = true;
-    api("/api/stats/timeseries")
-      .then((data: DailyUsage[]) => {
-        if (active) setDailyUsage(data);
-      })
-      .catch((error) => {
-        if ((error as Error).message === "AUTH") onLogout();
-        else notify((error as Error).message, "error");
-      });
+    void loadRates();
+    const refreshRates = () => void loadRates();
+    const timer = window.setInterval(refreshRates, 10_000);
+    document.addEventListener("visibilitychange", refreshRates);
     return () => {
-      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshRates);
     };
-  }, [notify, onLogout, refreshToken]);
+  }, [loadRates]);
+
+  useEffect(() => {
+    void loadDailyUsage();
+  }, [loadDailyUsage]);
+
+  const refreshUsage = useCallback(async () => {
+    const [recordsOK, ratesOK, dailyOK] = await Promise.all([
+      loadRecords(),
+      loadRates(true),
+      loadDailyUsage(true),
+    ]);
+    return recordsOK && ratesOK && dailyOK;
+  }, [loadDailyUsage, loadRates, loadRecords]);
+  useEffect(() => registerRefresh("usage", refreshUsage), [refreshUsage, registerRefresh]);
 
   const applyFilters = (event: React.FormEvent) => {
     event.preventDefault();
@@ -2535,13 +2693,7 @@ function Usage({
 
   return (
     <div className="page">
-      <div className="page-intro usage-page-intro">
-        <div>
-          <div className="eyebrow">AUDIT TRAIL</div>
-          <h1>使用记录</h1>
-          <p>按模型、时间与结果检查每次上游调用的吞吐和响应速度。</p>
-        </div>
-        <div className="usage-rate-rail" aria-label="最近 60 秒速率">
+      <div className="usage-rate-rail usage-rate-full" aria-label="最近 60 秒速率">
           <div className="usage-rate-context">
             <Activity size={16} />
             <span>
@@ -2562,7 +2714,6 @@ function Usage({
             <span>TPM</span>
             <strong>{fmt(rates.tpm)}</strong>
           </div>
-        </div>
       </div>
       <section className="panel daily-usage-panel">
         <div className="panel-head">
@@ -2717,14 +2868,33 @@ function Usage({
               <span>总耗时</span>
               <span>路径</span>
             </div>
-            {rows.map((r) => (
-              <div className="table-row" key={r.id}>
+            {rows.map((r) => {
+              const expanded = expandedRows.includes(r.id);
+              const detailsID = `usage-details-${r.id}`;
+              return (
+              <div className={`usage-row-group ${expanded ? "is-expanded" : ""}`} key={r.id}>
+              <div className="table-row">
                 <div>
                   <div className="request-model-line">
                     <b title={r.model}>{r.model}</b>
                     {r.request_kind === "vision_helper" && (
                       <span className="helper-tag">图片辅助</span>
                     )}
+                    <button
+                      className="usage-expand"
+                      type="button"
+                      title={expanded ? "收起请求详情" : "展开请求详情"}
+                      aria-label={expanded ? "收起请求详情" : "展开请求详情"}
+                      aria-expanded={expanded}
+                      aria-controls={detailsID}
+                      onClick={() => setExpandedRows((current) =>
+                        current.includes(r.id)
+                          ? current.filter((id) => id !== r.id)
+                          : [...current, r.id],
+                      )}
+                    >
+                      <ChevronDown size={15} />
+                    </button>
                   </div>
                   <small>{new Date(r.created_at).toLocaleString()}</small>
                 </div>
@@ -2758,6 +2928,9 @@ function Usage({
                   >
                     {r.stream === true ? "流式" : r.stream === false ? "非流式" : "未记录"}
                   </span>
+                  <span className="mobile-token-total">
+                    Token {r.total_tokens === undefined ? "—" : fmt(r.total_tokens)}
+                  </span>
                 </div>
                 <span className="usage-number">
                   {r.prompt_tokens === undefined ? "—" : fmt(r.prompt_tokens)}
@@ -2777,7 +2950,18 @@ function Usage({
                   {(r.route_engine || (r.proxy_uri ? "builtin" : "direct")) + " · " + (r.proxy_uri || "direct")}
                 </span>
               </div>
-            ))}
+              <div className="usage-mobile-detail" id={detailsID}>
+                <dl>
+                  <div><dt>客户端</dt><dd>{r.client_user_agent || "未记录"}</dd></div>
+                  <div><dt>输入 / 输出 Token</dt><dd>{r.prompt_tokens === undefined ? "—" : fmt(r.prompt_tokens)} / {r.completion_tokens === undefined ? "—" : fmt(r.completion_tokens)}</dd></div>
+                  <div><dt>首字 / 总耗时</dt><dd>{formatDuration(r.first_token_latency_ms)} / {formatDuration(r.latency_ms)}</dd></div>
+                  <div><dt>路径</dt><dd>{(r.route_engine || (r.proxy_uri ? "builtin" : "direct")) + " · " + (r.proxy_uri || "direct")}</dd></div>
+                  {r.error_message && <div><dt>错误</dt><dd>{r.error_message}</dd></div>}
+                </dl>
+              </div>
+              </div>
+              );
+            })}
             {loading && rows.length === 0 && <Empty text="正在加载使用记录…" />}
             {!loading && rows.length === 0 && (
               <Empty text="当前筛选条件下没有使用记录" />

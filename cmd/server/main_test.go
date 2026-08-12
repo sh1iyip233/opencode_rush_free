@@ -238,6 +238,201 @@ func TestFreeClassificationAndUsageParsing(t *testing.T) {
 	}
 }
 
+func TestForceFreeModelOverridesPersistAcrossRefreshes(t *testing.T) {
+	a := testApp(t)
+	upstreamModels := []byte(`{"data":[{"id":"alpha:free"},{"id":"provider/free-without-suffix"},{"id":"paid","pricing":{"prompt":"0.1","completion":"0.2"}}]}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(upstreamModels)
+	}))
+	defer upstream.Close()
+
+	put := httptest.NewRecorder()
+	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"`+upstream.URL+`"}`)))
+	if put.Code != http.StatusOK {
+		t.Fatalf("configure upstream failed: %d: %s", put.Code, put.Body.String())
+	}
+
+	firstRefresh := httptest.NewRecorder()
+	a.refreshModels(firstRefresh, httptest.NewRequest(http.MethodPost, "/api/settings/models/refresh", nil))
+	if firstRefresh.Code != http.StatusOK {
+		t.Fatalf("first refresh failed: %d: %s", firstRefresh.Code, firstRefresh.Body.String())
+	}
+	var detected int
+	if err := a.db.QueryRow("SELECT is_free FROM models WHERE model_id=?", "provider/free-without-suffix").Scan(&detected); err != nil || detected != 0 {
+		t.Fatalf("model without free metadata must not be auto-detected: free=%d err=%v", detected, err)
+	}
+
+	add := httptest.NewRecorder()
+	a.createForceFreeModel(add, httptest.NewRequest(http.MethodPost, "/api/model-overrides/free", strings.NewReader(`{"model_id":"provider/free-without-suffix"}`)))
+	if add.Code != http.StatusCreated {
+		t.Fatalf("creating free override failed: %d: %s", add.Code, add.Body.String())
+	}
+	var isFree int
+	var reason string
+	if err := a.db.QueryRow("SELECT is_free,free_reason FROM models WHERE model_id=?", "provider/free-without-suffix").Scan(&isFree, &reason); err != nil || isFree != 1 || reason != "manual_override" {
+		t.Fatalf("manual override was not immediately applied: free=%d reason=%q err=%v", isFree, reason, err)
+	}
+
+	models, _, err := a.loadModelRuntime()
+	if err != nil || models["provider/free-without-suffix"].Record.FreeReason != "manual_override" {
+		t.Fatalf("manual override was not exposed to runtime: %#v err=%v", models, err)
+	}
+	freeList := httptest.NewRecorder()
+	a.listFreeModels(freeList, httptest.NewRequest(http.MethodGet, "/api/models/free", nil))
+	var listed []ModelRecord
+	if freeList.Code != http.StatusOK || json.NewDecoder(freeList.Body).Decode(&listed) != nil || len(listed) != 2 || listed[1].ModelID != "provider/free-without-suffix" {
+		t.Fatalf("manual override was not exposed by the free model API: status=%d models=%#v", freeList.Code, listed)
+	}
+	knownClientKey := "force-free-model-test-client"
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.Exec("INSERT INTO client_keys(name,key_hash,key_hint,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)", "Force free test", hashToken(knownClientKey), "test", 1, now, now); err != nil {
+		t.Fatal(err)
+	}
+	a.invalidateClientKeyCache()
+	gatewayList := httptest.NewRecorder()
+	gatewayRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	gatewayRequest.Header.Set("Authorization", "Bearer "+knownClientKey)
+	a.gatewayModels(gatewayList, gatewayRequest)
+	var gatewayPayload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if gatewayList.Code != http.StatusOK || json.NewDecoder(gatewayList.Body).Decode(&gatewayPayload) != nil || len(gatewayPayload.Data) != 2 || gatewayPayload.Data[1].ID != "provider/free-without-suffix" {
+		t.Fatalf("manual override was not exposed by the gateway model API: status=%d payload=%#v", gatewayList.Code, gatewayPayload)
+	}
+
+	secondRefresh := httptest.NewRecorder()
+	a.refreshModels(secondRefresh, httptest.NewRequest(http.MethodPost, "/api/settings/models/refresh", nil))
+	if secondRefresh.Code != http.StatusOK {
+		t.Fatalf("second refresh failed: %d: %s", secondRefresh.Code, secondRefresh.Body.String())
+	}
+	if err := a.db.QueryRow("SELECT is_free,free_reason FROM models WHERE model_id=?", "provider/free-without-suffix").Scan(&isFree, &reason); err != nil || isFree != 1 || reason != "manual_override" {
+		t.Fatalf("refresh lost manual override: free=%d reason=%q err=%v", isFree, reason, err)
+	}
+
+	upstreamModels = []byte(`{"data":[{"id":"alpha:free"},{"id":"paid","pricing":{"prompt":"0.1","completion":"0.2"}}]}`)
+	missingRefresh := httptest.NewRecorder()
+	a.refreshModels(missingRefresh, httptest.NewRequest(http.MethodPost, "/api/settings/models/refresh", nil))
+	if missingRefresh.Code != http.StatusOK {
+		t.Fatalf("refresh with missing forced model failed: %d: %s", missingRefresh.Code, missingRefresh.Body.String())
+	}
+	var rules int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM force_free_models WHERE model_id=?", "provider/free-without-suffix").Scan(&rules); err != nil || rules != 1 {
+		t.Fatalf("missing upstream model must preserve its override: count=%d err=%v", rules, err)
+	}
+
+	upstreamModels = []byte(`{"data":[{"id":"alpha:free"},{"id":"provider/free-without-suffix"}]}`)
+	reappearedRefresh := httptest.NewRecorder()
+	a.refreshModels(reappearedRefresh, httptest.NewRequest(http.MethodPost, "/api/settings/models/refresh", nil))
+	if reappearedRefresh.Code != http.StatusOK {
+		t.Fatalf("refresh after model reappeared failed: %d: %s", reappearedRefresh.Code, reappearedRefresh.Body.String())
+	}
+	if err := a.db.QueryRow("SELECT is_free,free_reason FROM models WHERE model_id=?", "provider/free-without-suffix").Scan(&isFree, &reason); err != nil || isFree != 1 || reason != "manual_override" {
+		t.Fatalf("reappeared model did not restore override: free=%d reason=%q err=%v", isFree, reason, err)
+	}
+
+	deleteOverride := httptest.NewRecorder()
+	a.deleteForceFreeModel(deleteOverride, httptest.NewRequest(http.MethodDelete, "/api/model-overrides/free", strings.NewReader(`{"model_id":"provider/free-without-suffix"}`)))
+	if deleteOverride.Code != http.StatusOK {
+		t.Fatalf("deleting free override failed: %d: %s", deleteOverride.Code, deleteOverride.Body.String())
+	}
+	if err := a.db.QueryRow("SELECT is_free,free_reason FROM models WHERE model_id=?", "provider/free-without-suffix").Scan(&isFree, &reason); err != nil || isFree != 0 || reason != "" {
+		t.Fatalf("deleting override did not restore automatic classification: free=%d reason=%q err=%v", isFree, reason, err)
+	}
+}
+
+func TestForceFreeModelOverrideInputValidation(t *testing.T) {
+	for _, input := range []string{"", "  ", "model id", "model\nname"} {
+		if _, err := normalizeForceFreeModelID(input); err == nil {
+			t.Fatalf("expected invalid model ID %q to be rejected", input)
+		}
+	}
+	if modelID, err := normalizeForceFreeModelID(" provider/model "); err != nil || modelID != "provider/model" {
+		t.Fatalf("valid model ID was not normalized: %q %v", modelID, err)
+	}
+}
+
+func TestForceFreeModelOverrideRoutesRequireAdmin(t *testing.T) {
+	a := testApp(t)
+	mux := http.NewServeMux()
+	a.routes(mux)
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/model-overrides/free", nil),
+		httptest.NewRequest(http.MethodPost, "/api/model-overrides/free", strings.NewReader(`{"model_id":"provider/model"}`)),
+		httptest.NewRequest(http.MethodDelete, "/api/model-overrides/free", strings.NewReader(`{"model_id":"provider/model"}`)),
+	} {
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s should require admin, got %d: %s", request.Method, request.URL.Path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestMaintenanceModeAllowsOnlyWhitelistedClientKeys(t *testing.T) {
+	a := testApp(t)
+	allowedKey := "maintenance-allowed-key"
+	blockedKey := "maintenance-blocked-key"
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, entry := range []struct {
+		name    string
+		value   string
+		allowed int
+	}{
+		{name: "Allowed", value: allowedKey, allowed: 1},
+		{name: "Blocked", value: blockedKey, allowed: 0},
+	} {
+		if _, err := a.db.Exec("INSERT INTO client_keys(name,key_hash,key_hint,enabled,maintenance_allowed,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", entry.name, hashToken(entry.value), "test", 1, entry.allowed, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.invalidateClientKeyCache()
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "maintenance:free", "Maintenance", 1, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	a.invalidateModelRuntimeCache()
+
+	mux := http.NewServeMux()
+	a.routes(mux)
+	handler := a.withMiddleware(mux)
+	request := func(path, key string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	if response := request("/v1/models", blockedKey); response.Code != http.StatusOK {
+		t.Fatalf("gateway should be open before maintenance mode: %d %s", response.Code, response.Body.String())
+	}
+
+	put := httptest.NewRecorder()
+	a.putMaintenanceSettings(put, httptest.NewRequest(http.MethodPut, "/api/settings/maintenance", strings.NewReader(`{"enabled":true}`)))
+	if put.Code != http.StatusOK {
+		t.Fatalf("enabling maintenance mode failed: %d %s", put.Code, put.Body.String())
+	}
+	if response := request("/v1/models", blockedKey); response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "maintenance_mode") {
+		t.Fatalf("blocked key should receive maintenance 503: %d %s", response.Code, response.Body.String())
+	}
+	if response := request("/v1/models", allowedKey); response.Code != http.StatusOK {
+		t.Fatalf("whitelisted key should pass maintenance mode: %d %s", response.Code, response.Body.String())
+	}
+	if response := request("/v1/models", "invalid-key"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid key must keep the regular authentication response: %d", response.Code)
+	}
+	if response := request("/healthz", ""); response.Code != http.StatusOK {
+		t.Fatalf("health check must remain available during maintenance: %d", response.Code)
+	}
+}
+
 func TestImageInputDetectionAndModelCapabilities(t *testing.T) {
 	textOnly := []byte(`{"architecture":{"input_modalities":["text"],"modality":"text->text"}}`)
 	if known, supports := modelImageSupport(textOnly); !known || supports {

@@ -88,3 +88,24 @@ func TestPublicStatusAggregatesAllFreeModelsWithoutAdminSession(t *testing.T) {
 		t.Fatal("public status route returned the SPA instead of JSON")
 	}
 }
+
+func TestPublicStatusReportsMaintenanceMode(t *testing.T) {
+	a := testApp(t)
+	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", maintenanceModeSettingKey, "true"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	a.publicStatus(recorder, httptest.NewRequest(http.MethodGet, "/api/public/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public status failed: %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		MaintenanceMode bool `json:"maintenance_mode"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.MaintenanceMode {
+		t.Fatal("public status did not report maintenance mode")
+	}
+}

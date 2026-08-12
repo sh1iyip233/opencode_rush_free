@@ -887,6 +887,7 @@ button.status-tag {
 .vision-grid label,
 .key-create-grid label,
 .alias-create-grid label,
+.force-free-create-grid label,
 .operations-grid > label:not(.vision-proxy-toggle),
 .routing-controls label,
 .expiry-controls label,
@@ -1179,6 +1180,7 @@ textarea {
 
 .key-create-grid,
 .alias-create-grid,
+.force-free-create-grid,
 .password-grid,
 .operations-grid {
   display: grid;
@@ -1194,6 +1196,22 @@ textarea {
   grid-template-columns: minmax(140px, 0.8fr) minmax(210px, 1.5fr) auto;
 }
 
+.force-free-create-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  align-items: end;
+  gap: 11px;
+}
+
+.force-free-panel {
+  border-color: #d1dbd1;
+  background: #edf1ec;
+}
+
+.force-free-list .reason {
+  flex: none;
+}
+
 .password-grid {
   grid-template-columns: repeat(2, minmax(180px, 1fr)) auto;
 }
@@ -1206,6 +1224,30 @@ textarea {
 .operations-panel {
   border-color: #d1dbd1;
   background: #edf1ec;
+}
+
+.maintenance-mode-toggle {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+}
+
+.maintenance-mode-toggle input:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.maintenance-key-toggle {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.maintenance-key-toggle input {
+  flex: none;
 }
 
 .alert-grid {
@@ -1979,6 +2021,27 @@ textarea {
   box-shadow: 0 0 0 4px #57927422;
 }
 
+.public-status-live.maintenance {
+  color: var(--warning);
+}
+
+.public-status-live.maintenance i {
+  background: var(--warning);
+  box-shadow: 0 0 0 4px #8a681d22;
+}
+
+.public-status-maintenance {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--warning);
+  color: #6d5316;
+  background: var(--warning-bg);
+  font-size: 11px;
+}
+
 .public-status-main {
   width: min(1180px, calc(100% - 64px));
   margin: 0 auto;
@@ -2438,6 +2501,7 @@ textarea {
   .model-grid,
   .key-create-grid,
   .alias-create-grid,
+  .force-free-create-grid,
   .password-grid,
   .operations-grid {
     grid-template-columns: 1fr;

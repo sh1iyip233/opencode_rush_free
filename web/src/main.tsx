@@ -84,6 +84,10 @@ type Model = {
   refreshed_at: string;
   admin_enabled?: boolean;
 };
+type ForceFreeModel = {
+  model_id: string;
+  created_at: string;
+};
 type RequestRow = {
   id: number;
   created_at: string;
@@ -126,6 +130,7 @@ type ClientKey = {
   name: string;
   hint: string;
   enabled: boolean;
+  maintenance_allowed: boolean;
   expires_at?: string;
   rpm_limit: number;
   tpm_limit: number;
@@ -153,6 +158,7 @@ type AlertSettings = {
   success_rate_percent: number;
 };
 type ProbeSettings = { enabled: boolean; exit_minutes: number; upstream_minutes: number };
+type MaintenanceSettings = { enabled: boolean };
 type UsagePage = {
   items: RequestRow[];
   page: number;
@@ -214,6 +220,7 @@ type PublicStatusResponse = {
   window_start: string;
   window_end: string;
   bucket_hours: number;
+  maintenance_mode?: boolean;
   summary: {
     models: number;
     requests_24h: number;
@@ -273,6 +280,8 @@ const publicApi = async (path: string, init: RequestInit = {}) => {
   return data;
 };
 const fmt = (n: number) => new Intl.NumberFormat("zh-CN").format(n || 0);
+const freeReasonText = (reason: string) =>
+  reason === "manual_override" ? "手动指定" : reason.replaceAll("_", " ");
 const headersToText = (headers?: Record<string, string>) =>
   Object.entries(headers || {})
     .map(([name, value]) => `${name}: ${value}`)
@@ -428,7 +437,7 @@ function PublicStatusPage() {
           </span>
         </a>
         <div className="public-status-header-actions">
-          <span className="public-status-live"><i />实时数据</span>
+          <span className={`public-status-live ${data?.maintenance_mode ? "maintenance" : ""}`}><i />{data?.maintenance_mode ? "维护中" : "实时数据"}</span>
           <button
             className="icon-btn"
             type="button"
@@ -462,6 +471,12 @@ function PublicStatusPage() {
             <TriangleAlert size={16} />
             <span>{error}</span>
             <button type="button" onClick={() => void load()}>重试</button>
+          </div>
+        )}
+        {data?.maintenance_mode && (
+          <div className="public-status-maintenance" role="status">
+            <TriangleAlert size={16} />
+            <span>服务正在维护，新的模型请求暂时不可用。</span>
           </div>
         )}
         {loading && !data ? (
@@ -990,7 +1005,7 @@ function Overview({
                 <div>
                   <b>{model.model_id}</b>
                   <small>
-                    {model.free_reason.replaceAll("_", " ")} · 更新于{" "}
+                    {freeReasonText(model.free_reason)} · 更新于{" "}
                     {new Date(model.refreshed_at).toLocaleDateString()}
                   </small>
                 </div>
@@ -1840,6 +1855,7 @@ function ClientKeysPanel({
       {keys.map((key) => <div className="key-row" key={key.id}>
         <div><b>{key.name}</b><small>{key.hint} · {key.rpm_limit || "∞"} RPM · {key.tpm_limit || "∞"} TPM{key.expires_at ? ` · 到期 ${new Date(key.expires_at).toLocaleString()}` : ""}{key.last_used_at ? ` · 最近使用 ${new Date(key.last_used_at).toLocaleString()}` : ""}</small></div>
         <span className={`health ${key.enabled ? "healthy" : "disabled"}`}><i />{key.enabled ? "启用" : "已停用"}</span>
+        <label className="maintenance-key-toggle" title="Only allow this key through the gateway during maintenance"><input type="checkbox" checked={key.maintenance_allowed} onChange={(event) => void update(key, { maintenance_allowed: event.target.checked })} disabled={busy || !key.enabled} /><span>维护放行</span></label>
         <div className="row-actions"><button className="icon-btn" title={key.enabled ? "停用 Key" : "启用 Key"} onClick={() => void update(key, { enabled: !key.enabled })} disabled={busy}><KeyRound size={15} /></button><button className="icon-btn" title="轮换 Key" onClick={() => void rotate(key)} disabled={busy}><RefreshCw size={15} /></button>{keys.length > 1 && <button className="icon-btn" title="删除 Key" onClick={() => void remove(key)} disabled={busy}><Trash2 size={15} /></button>}</div>
       </div>)}
     </div>
@@ -1876,6 +1892,106 @@ function ModelAliasesPanel({
     <div className="panel-head"><div><span className="eyebrow">STABLE ROUTES</span><h3>模型别名</h3><p className="muted">别名始终映射到一个已启用的 Free 模型。</p></div><Database size={20} /></div>
     <div className="alias-create-grid"><label>别名<input value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="free-fast" /></label><label>目标模型<select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">选择模型</option>{models.filter((model) => model.admin_enabled !== false).map((model) => <option key={model.model_id} value={model.model_id}>{model.model_id}</option>)}</select></label><button className="secondary" onClick={create} disabled={!alias || !target}>添加别名</button></div>
     <div className="key-list">{aliases.map((item) => <div className="key-row" key={item.id}><div><b>{item.alias}</b><small>→ {item.target_model_id}</small></div><span className={`health ${item.enabled ? "healthy" : "disabled"}`}><i />{item.enabled ? "启用" : "已停用"}</span><div className="row-actions"><button className="icon-btn" title={item.enabled ? "停用别名" : "启用别名"} onClick={async () => { try { await api(`/api/model-aliases/${item.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !item.enabled }) }); await load(); } catch (error) { notify((error as Error).message, "error"); } }}><KeyRound size={15} /></button><button className="icon-btn" title="删除别名" onClick={async () => { try { await api(`/api/model-aliases/${item.id}`, { method: "DELETE" }); await load(); } catch (error) { notify((error as Error).message, "error"); } }}><Trash2 size={15} /></button></div></div>)}</div>
+  </section>;
+}
+
+function ForceFreeModelsPanel({
+  models,
+  notify,
+  reload,
+  registerRefresh,
+}: {
+  models: Model[];
+  notify: (v: string, type?: ToastType) => void;
+  reload: () => Promise<unknown>;
+  registerRefresh?: RegisterChildRefresh;
+}) {
+  const [items, setItems] = useState<ForceFreeModel[]>([]);
+  const [modelID, setModelID] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try {
+      setItems((await api("/api/model-overrides/free")) as ForceFreeModel[]);
+      return true;
+    } catch (error) {
+      notify((error as Error).message, "error");
+      return false;
+    }
+  }, [notify]);
+  useEffect(() => void load(), [load]);
+  useEffect(() => registerRefresh?.(load), [load, registerRefresh]);
+  const add = async () => {
+    const value = modelID.trim();
+    if (!value) return;
+    setBusy(true);
+    try {
+      await api("/api/model-overrides/free", {
+        method: "POST",
+        body: JSON.stringify({ model_id: value }),
+      });
+      setModelID("");
+      await Promise.all([load(), reload()]);
+      notify("已将模型标记为免费");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (value: string) => {
+    setBusy(true);
+    try {
+      await api("/api/model-overrides/free", {
+        method: "DELETE",
+        body: JSON.stringify({ model_id: value }),
+      });
+      await Promise.all([load(), reload()]);
+      notify("已恢复自动模型识别");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const available = new Set(models.map((model) => model.model_id));
+  return <section className="panel force-free-panel">
+    <div className="panel-head">
+      <div>
+        <span className="eyebrow">FREE MODEL OVERRIDES</span>
+        <h3>强制免费模型</h3>
+        <p className="muted">按完整模型 ID 固定标记为免费；模型重新被上游发现时自动生效。</p>
+      </div>
+      <Check size={20} />
+    </div>
+    <div className="force-free-create-grid">
+      <label>
+        模型 ID
+        <input
+          value={modelID}
+          onChange={(event) => setModelID(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void add();
+          }}
+          placeholder="provider/model-name"
+          spellCheck={false}
+        />
+      </label>
+      <button className="secondary" onClick={() => void add()} disabled={busy || !modelID.trim()}>
+        添加免费模型
+      </button>
+    </div>
+    {items.length > 0 && <div className="key-list force-free-list">
+      {items.map((item) => <div className="key-row" key={item.model_id}>
+        <div>
+          <b>{item.model_id}</b>
+          <small>{available.has(item.model_id) ? "上游已发现，当前可用" : "等待上游模型列表再次发现"}</small>
+        </div>
+        <span className="reason">手动指定</span>
+        <button className="icon-btn" title="删除免费模型标记" onClick={() => void remove(item.model_id)} disabled={busy}>
+          <Trash2 size={15} />
+        </button>
+      </div>)}
+    </div>}
   </section>;
 }
 
@@ -2232,13 +2348,14 @@ function Models({
               <b>{m.model_id}</b>
               <small>{m.display_name}</small>
               <span className="reason">
-                {m.free_reason.replaceAll("_", " ")}
+                {freeReasonText(m.free_reason)}
               </span>
             </div>
           ))}
           {models.length === 0 && <Empty text="刷新上游以发现 Free 模型" />}
         </div>
       </section>
+      <ForceFreeModelsPanel models={models} notify={notify} reload={reload} registerRefresh={registerChildRefresh} />
       <ModelAliasesPanel models={models} notify={notify} registerRefresh={registerChildRefresh} />
       <ClientKeysPanel notify={notify} registerRefresh={registerChildRefresh} />
     </div>
@@ -2317,6 +2434,7 @@ function OperationsSettings({
   const [probes, setProbes] = useState<ProbeSettings>({ enabled: true, exit_minutes: 15, upstream_minutes: 60 });
   const [alerts, setAlerts] = useState<AlertSettings>({ enabled: false, webhook_url: "", has_webhook_secret: false, events: alertEventOptions.map((event) => event.value), low_proxy_threshold: 3, success_rate_percent: 80 });
   const [refreshMinutes, setRefreshMinutes] = useState(360);
+  const [maintenance, setMaintenance] = useState<MaintenanceSettings>({ enabled: false });
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const load = useCallback(async () => {
@@ -2324,11 +2442,13 @@ function OperationsSettings({
       api("/api/settings/probes"),
       api("/api/settings/alerts"),
       api("/api/settings/model-refresh"),
+      api("/api/settings/maintenance"),
     ]);
-    const [probeResult, alertResult, refreshResult] = results;
+    const [probeResult, alertResult, refreshResult, maintenanceResult] = results;
       if (probeResult.status === "fulfilled") setProbes(probeResult.value as ProbeSettings);
       if (alertResult.status === "fulfilled") setAlerts(alertResult.value as AlertSettings);
       if (refreshResult.status === "fulfilled") setRefreshMinutes(refreshResult.value.refresh_minutes);
+      if (maintenanceResult.status === "fulfilled") setMaintenance(maintenanceResult.value as MaintenanceSettings);
     return results.every((result) => result.status === "fulfilled");
   }, []);
   useEffect(() => void load(), [load]);
@@ -2340,6 +2460,7 @@ function OperationsSettings({
         api("/api/settings/probes", { method: "PUT", body: JSON.stringify(probes) }),
         api("/api/settings/model-refresh", { method: "PUT", body: JSON.stringify({ refresh_minutes: refreshMinutes }) }),
         api("/api/settings/alerts", { method: "PUT", body: JSON.stringify({ ...alerts, webhook_secret: secret || undefined }) }),
+        api("/api/settings/maintenance", { method: "PUT", body: JSON.stringify(maintenance) }),
       ]);
       setSecret("");
       notify("运行与告警设置已保存");
@@ -2350,6 +2471,7 @@ function OperationsSettings({
   return <section className="panel operations-panel">
     <div className="panel-head"><div><span className="eyebrow">OPERATIONS</span><h3>探测、刷新与告警</h3><p className="muted">探测默认开启，告警仅在配置 Webhook 后启用。</p></div><Radio size={20} /></div>
     <div className="operations-grid">
+      <label className="vision-proxy-toggle maintenance-mode-toggle"><input type="checkbox" checked={maintenance.enabled} onChange={(event) => setMaintenance({ enabled: event.target.checked })} /><span><b>维护模式</b><small>{maintenance.enabled ? "仅维护白名单 Key 可调用网关" : "所有启用的 Client Key 可调用网关"}</small></span></label>
       <label className="vision-proxy-toggle"><input type="checkbox" checked={probes.enabled} onChange={(event) => setProbes((current) => ({ ...current, enabled: event.target.checked }))} /><span><b>后台代理探测</b><small>出口与上游路径定时复测</small></span></label>
       <label>出口探测（分钟）<input type="number" min="5" value={probes.exit_minutes} onChange={(event) => setProbes((current) => ({ ...current, exit_minutes: Number(event.target.value) }))} /></label>
       <label>上游探测（分钟）<input type="number" min="15" value={probes.upstream_minutes} onChange={(event) => setProbes((current) => ({ ...current, upstream_minutes: Number(event.target.value) }))} /></label>

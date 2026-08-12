@@ -368,8 +368,9 @@ CREATE TABLE IF NOT EXISTS models (id INTEGER PRIMARY KEY AUTOINCREMENT, model_i
 CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, resolved_model TEXT, client_key_id INTEGER, client_key_name TEXT, client_name TEXT, client_user_agent TEXT, stream INTEGER, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT 'builtin', attempt_summary TEXT, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS session_proxy_routes (session_key TEXT PRIMARY KEY, proxy_id INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS resin_session_routes (session_key TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, request_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS client_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_hint TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, expires_at TEXT, rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0, last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS client_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_hint TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, maintenance_allowed INTEGER NOT NULL DEFAULT 0, expires_at TEXT, rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0, last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_policies (model_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS force_free_models (model_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_aliases (id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL UNIQUE, target_model_id TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL, event_type TEXT NOT NULL, severity TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);
 CREATE TABLE IF NOT EXISTS proxy_probe_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, mode TEXT NOT NULL, total INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
@@ -395,6 +396,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"ALTER TABLE usage_requests ADD COLUMN client_user_agent TEXT",
 		"ALTER TABLE usage_requests ADD COLUMN stream INTEGER",
 		"ALTER TABLE usage_requests ADD COLUMN attempt_summary TEXT",
+		"ALTER TABLE client_keys ADD COLUMN maintenance_allowed INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE proxies ADD COLUMN last_probe_at TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_probe_latency_ms INTEGER",
 		"ALTER TABLE proxies ADD COLUMN last_exit_ip TEXT",
@@ -657,6 +659,8 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/settings/proxy-engine/resin/recover", a.requireAdmin(a.recoverResin))
 	mux.HandleFunc("GET /api/settings/usage-retention", a.requireAdmin(a.getUsageRetention))
 	mux.HandleFunc("PUT /api/settings/usage-retention", a.requireAdmin(a.putUsageRetention))
+	mux.HandleFunc("GET /api/settings/maintenance", a.requireAdmin(a.getMaintenanceSettings))
+	mux.HandleFunc("PUT /api/settings/maintenance", a.requireAdmin(a.putMaintenanceSettings))
 	mux.HandleFunc("POST /api/settings/upstream/test", a.requireAdmin(a.testUpstream))
 	mux.HandleFunc("POST /api/settings/client-key/rotate", a.requireAdmin(a.rotateClientKey))
 	mux.HandleFunc("GET /api/client-keys", a.requireAdmin(a.listClientKeys))
@@ -670,6 +674,9 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/models", a.requireAdmin(a.listModels))
 	mux.HandleFunc("GET /api/models/free", a.requireAdmin(a.listFreeModels))
 	mux.HandleFunc("PATCH /api/models/{id}/policy", a.requireAdmin(a.patchModelPolicy))
+	mux.HandleFunc("GET /api/model-overrides/free", a.requireAdmin(a.listForceFreeModels))
+	mux.HandleFunc("POST /api/model-overrides/free", a.requireAdmin(a.createForceFreeModel))
+	mux.HandleFunc("DELETE /api/model-overrides/free", a.requireAdmin(a.deleteForceFreeModel))
 	mux.HandleFunc("GET /api/model-aliases", a.requireAdmin(a.listModelAliases))
 	mux.HandleFunc("POST /api/model-aliases", a.requireAdmin(a.createModelAlias))
 	mux.HandleFunc("PATCH /api/model-aliases/{id}", a.requireAdmin(a.patchModelAlias))
@@ -711,6 +718,20 @@ func (a *App) withMiddleware(next http.Handler) http.Handler {
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
 			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			maintenance, err := a.maintenanceModeEnabled()
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "gateway temporarily unavailable", "code": "gateway_unavailable"})
+				return
+			}
+			if maintenance {
+				key, authErr := a.authenticateClient(r)
+				if authErr == nil && !key.MaintenanceAllowed {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable for maintenance", "code": "maintenance_mode"})
+					return
+				}
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -1370,6 +1391,12 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
 	}
+	forceFreeModels, e := a.forceFreeModelSet(tx)
+	if e != nil {
+		_ = tx.Rollback()
+		writeJSON(w, 500, map[string]string{"error": "could not load model overrides"})
+		return
+	}
 	free := 0
 	seenModels := []string{}
 	for _, m := range payload.Data {
@@ -1385,6 +1412,9 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		}
 		pricing, _ := json.Marshal(m["pricing"])
 		isFree, reason := classifyFree(id, m)
+		if _, forced := forceFreeModels[id]; forced {
+			isFree, reason = true, "manual_override"
+		}
 		if isFree {
 			free++
 		}

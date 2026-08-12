@@ -21,6 +21,12 @@ type engineRuntimeCache struct {
 	cfg    proxyEngineConfig
 }
 
+type maintenanceRuntimeCache struct {
+	mu      sync.RWMutex
+	loaded  bool
+	enabled bool
+}
+
 type cachedClientKey struct {
 	key           ClientKey
 	lastTouchNano atomic.Int64
@@ -46,10 +52,11 @@ type modelRuntimeCache struct {
 }
 
 type runtimeCaches struct {
-	upstream upstreamRuntimeCache
-	engine   engineRuntimeCache
-	keys     clientKeyRuntimeCache
-	models   modelRuntimeCache
+	upstream    upstreamRuntimeCache
+	engine      engineRuntimeCache
+	maintenance maintenanceRuntimeCache
+	keys        clientKeyRuntimeCache
+	models      modelRuntimeCache
 
 	routingMu     sync.RWMutex
 	routingLimit  int
@@ -99,6 +106,13 @@ func (a *App) invalidateProxyEngineCache() {
 	a.runtimeCaches.engine.loaded = false
 	a.runtimeCaches.engine.cfg = proxyEngineConfig{}
 	a.runtimeCaches.engine.mu.Unlock()
+}
+
+func (a *App) setCachedMaintenanceMode(enabled bool) {
+	a.runtimeCaches.maintenance.mu.Lock()
+	a.runtimeCaches.maintenance.loaded = true
+	a.runtimeCaches.maintenance.enabled = enabled
+	a.runtimeCaches.maintenance.mu.Unlock()
 }
 
 func (a *App) invalidateClientKeyCache() {
@@ -164,7 +178,7 @@ func (a *App) loadCachedClientKeys() (map[string]*cachedClientKey, error) {
 	if a.runtimeCaches.keys.loaded {
 		return a.runtimeCaches.keys.byHash, nil
 	}
-	rows, err := a.db.Query("SELECT id,name,key_hash,key_hint,enabled,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys ORDER BY id")
+	rows, err := a.db.Query("SELECT id,name,key_hash,key_hint,enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -173,12 +187,13 @@ func (a *App) loadCachedClientKeys() (map[string]*cachedClientKey, error) {
 	for rows.Next() {
 		var key ClientKey
 		var hash string
-		var enabled int
+		var enabled, maintenanceAllowed int
 		var expires, lastUsed, created string
-		if err := rows.Scan(&key.ID, &key.Name, &hash, &key.Hint, &enabled, &expires, &key.RPMLimit, &key.TPMLimit, &lastUsed, &created); err != nil {
+		if err := rows.Scan(&key.ID, &key.Name, &hash, &key.Hint, &enabled, &maintenanceAllowed, &expires, &key.RPMLimit, &key.TPMLimit, &lastUsed, &created); err != nil {
 			return nil, err
 		}
 		key.Enabled = enabled == 1
+		key.MaintenanceAllowed = maintenanceAllowed == 1
 		key.ExpiresAt = parseStoredTime(expires)
 		key.LastUsedAt = parseStoredTime(lastUsed)
 		key.CreatedAt, _ = time.Parse(time.RFC3339, created)

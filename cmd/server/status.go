@@ -51,6 +51,11 @@ type publicStatusAggregate struct {
 }
 
 func (a *App) publicStatus(w http.ResponseWriter, _ *http.Request) {
+	maintenanceMode, err := a.maintenanceModeEnabled()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load public status"})
+		return
+	}
 	now := time.Now().UTC()
 	currentHour := chinaHourStart(now)
 	windowStart := currentHour.Add(-time.Duration(publicStatusWindowHours-1) * time.Hour)
@@ -175,11 +180,12 @@ func (a *App) publicStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "public, max-age=30, stale-while-revalidate=30")
 	writeJSON(w, http.StatusOK, map[string]any{
-		"generated_at": now,
-		"timezone":     "Asia/Shanghai",
-		"window_start": windowStart,
-		"window_end":   now,
-		"bucket_hours": publicStatusWindowHours,
+		"generated_at":     now,
+		"maintenance_mode": maintenanceMode,
+		"timezone":         "Asia/Shanghai",
+		"window_start":     windowStart,
+		"window_end":       now,
+		"bucket_hours":     publicStatusWindowHours,
 		"summary": publicStatusSummary{
 			Models:            len(output),
 			Requests24h:       summaryAggregate.Requests,

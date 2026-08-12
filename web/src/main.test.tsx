@@ -76,6 +76,7 @@ const adminResponse = (input: RequestInfo | URL, init?: RequestInit) => {
   if (path === "/api/models/free") return json([model]);
   if (path === "/api/public/status") return json(publicStatus);
   if (path === "/api/settings/upstream") return json({});
+  if (path === "/api/settings/maintenance") return json({ enabled: false });
   if (path.startsWith("/api/stats/models?")) return json([]);
   if (path.startsWith("/api/stats/proxies?")) return json([]);
   if (path.startsWith("/api/proxies?")) {
@@ -93,6 +94,7 @@ const adminResponse = (input: RequestInfo | URL, init?: RequestInit) => {
     });
   }
   if (path === "/api/model-aliases") return json([]);
+  if (path === "/api/model-overrides/free") return json([]);
   if (path === "/api/client-keys") return json([]);
   if (path.startsWith("/api/usage/requests?")) {
     const page = Number(new URL(path, "http://relay.test").searchParams.get("page") || 1);
@@ -363,6 +365,65 @@ describe("运维操作", () => {
     await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith(
       "/api/models/7/policy",
       expect.objectContaining({ method: "PATCH" }),
+    ));
+  });
+
+  it("为没有 free 后缀的模型添加持久免费标记", async () => {
+    const reload = vi.fn(async () => true);
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/model-aliases" || path === "/api/client-keys") return json([]);
+      if (path === "/api/model-overrides/free" && (!init?.method || init.method === "GET")) return json([]);
+      if (path === "/api/model-overrides/free" && init?.method === "POST") {
+        return json({ model_id: "provider/model", created_at: "2026-08-12T00:00:00Z" }, 201);
+      }
+      return json({});
+    });
+    render(<Models models={[]} upstream={{}} reload={reload} notify={vi.fn()} />);
+
+    fireEvent.change(await screen.findByPlaceholderText("provider/model-name"), { target: { value: "provider/model" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加免费模型" }));
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "/api/model-overrides/free",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ model_id: "provider/model" }) }),
+    ));
+    expect(reload).toHaveBeenCalled();
+  });
+
+  it("保存维护模式并只对标记的 Client Key 放行", async () => {
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/settings/probes") return json({ enabled: true, exit_minutes: 15, upstream_minutes: 60 });
+      if (path === "/api/settings/alerts") return json({ enabled: false, webhook_url: "", has_webhook_secret: false, events: [], low_proxy_threshold: 3, success_rate_percent: 80 });
+      if (path === "/api/settings/model-refresh") return json({ refresh_minutes: 360 });
+      if (path === "/api/settings/maintenance" && (!init?.method || init.method === "GET")) return json({ enabled: false });
+      if (path === "/api/settings/maintenance" && init?.method === "PUT") return json({ enabled: true });
+      if (path === "/api/models/free") return json([model]);
+      if (path === "/api/model-aliases" || path === "/api/model-overrides/free") return json([]);
+      if (path === "/api/client-keys" && (!init?.method || init.method === "GET")) return json([{ id: 2, name: "Deploy", hint: "ocp...test", enabled: true, maintenance_allowed: false, rpm_limit: 0, tpm_limit: 0 }]);
+      if (path === "/api/client-keys/2" && init?.method === "PATCH") return json({});
+      return json({});
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "仪表盘" });
+
+    fireEvent.click(screen.getByRole("button", { name: /设置Settings/ }));
+    const maintenanceToggle = await screen.findByRole("checkbox", { name: /维护模式/ });
+    fireEvent.click(maintenanceToggle);
+    fireEvent.click(screen.getByRole("button", { name: "保存运行设置" }));
+
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "/api/settings/maintenance",
+      expect.objectContaining({ method: "PUT", body: JSON.stringify({ enabled: true }) }),
+    ));
+
+    fireEvent.click(screen.getByRole("button", { name: /模型与网关Models/ }));
+    const allowDuringMaintenance = await screen.findByRole("checkbox", { name: "维护放行" });
+    fireEvent.click(allowDuringMaintenance);
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "/api/client-keys/2",
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ maintenance_allowed: true }) }),
     ));
   });
 });

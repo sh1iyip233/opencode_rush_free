@@ -16,16 +16,17 @@ import (
 )
 
 type ClientKey struct {
-	ID         int64      `json:"id"`
-	Name       string     `json:"name"`
-	Hint       string     `json:"hint"`
-	Enabled    bool       `json:"enabled"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	RPMLimit   int        `json:"rpm_limit"`
-	TPMLimit   int        `json:"tpm_limit"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	lastTouch  *atomic.Int64
+	ID                 int64      `json:"id"`
+	Name               string     `json:"name"`
+	Hint               string     `json:"hint"`
+	Enabled            bool       `json:"enabled"`
+	MaintenanceAllowed bool       `json:"maintenance_allowed"`
+	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
+	RPMLimit           int        `json:"rpm_limit"`
+	TPMLimit           int        `json:"tpm_limit"`
+	LastUsedAt         *time.Time `json:"last_used_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	lastTouch          *atomic.Int64
 }
 
 type keyWindow struct {
@@ -207,12 +208,13 @@ type clientKeyScanner interface {
 
 func scanClientKey(row clientKeyScanner) (*ClientKey, error) {
 	var key ClientKey
-	var enabled int
+	var enabled, maintenanceAllowed int
 	var expires, lastUsed, created string
-	if err := row.Scan(&key.ID, &key.Name, &key.Hint, &enabled, &expires, &key.RPMLimit, &key.TPMLimit, &lastUsed, &created); err != nil {
+	if err := row.Scan(&key.ID, &key.Name, &key.Hint, &enabled, &maintenanceAllowed, &expires, &key.RPMLimit, &key.TPMLimit, &lastUsed, &created); err != nil {
 		return nil, err
 	}
 	key.Enabled = enabled == 1
+	key.MaintenanceAllowed = maintenanceAllowed == 1
 	key.ExpiresAt = parseStoredTime(expires)
 	key.LastUsedAt = parseStoredTime(lastUsed)
 	key.CreatedAt, _ = time.Parse(time.RFC3339, created)
@@ -267,7 +269,7 @@ func (a *App) touchClientKey(key *ClientKey) {
 }
 
 func (a *App) listClientKeys(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT id,name,key_hint,enabled,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys ORDER BY id")
+	rows, err := a.db.Query("SELECT id,name,key_hint,enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys ORDER BY id")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query client keys"})
 		return
@@ -355,11 +357,12 @@ func (a *App) patchClientKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Name      *string `json:"name"`
-		Enabled   *bool   `json:"enabled"`
-		ExpiresAt *string `json:"expires_at"`
-		RPMLimit  *int    `json:"rpm_limit"`
-		TPMLimit  *int    `json:"tpm_limit"`
+		Name               *string `json:"name"`
+		Enabled            *bool   `json:"enabled"`
+		MaintenanceAllowed *bool   `json:"maintenance_allowed"`
+		ExpiresAt          *string `json:"expires_at"`
+		RPMLimit           *int    `json:"rpm_limit"`
+		TPMLimit           *int    `json:"tpm_limit"`
 	}
 	if readJSON(r, &in) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid client key update"})
@@ -384,6 +387,9 @@ func (a *App) patchClientKey(w http.ResponseWriter, r *http.Request) {
 	if in.Enabled != nil {
 		current.Enabled = *in.Enabled
 	}
+	if in.MaintenanceAllowed != nil {
+		current.MaintenanceAllowed = *in.MaintenanceAllowed
+	}
 	if in.RPMLimit != nil {
 		current.RPMLimit = *in.RPMLimit
 	}
@@ -405,7 +411,7 @@ func (a *App) patchClientKey(w http.ResponseWriter, r *http.Request) {
 	if current.ExpiresAt != nil {
 		expiry = current.ExpiresAt.Format(time.RFC3339)
 	}
-	_, err = a.db.Exec("UPDATE client_keys SET name=?,enabled=?,expires_at=?,rpm_limit=?,tpm_limit=?,updated_at=? WHERE id=?", current.Name, boolInt(current.Enabled), expiry, current.RPMLimit, current.TPMLimit, time.Now().UTC().Format(time.RFC3339), id)
+	_, err = a.db.Exec("UPDATE client_keys SET name=?,enabled=?,maintenance_allowed=?,expires_at=?,rpm_limit=?,tpm_limit=?,updated_at=? WHERE id=?", current.Name, boolInt(current.Enabled), boolInt(current.MaintenanceAllowed), expiry, current.RPMLimit, current.TPMLimit, time.Now().UTC().Format(time.RFC3339), id)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not update client key"})
 		return
@@ -415,7 +421,7 @@ func (a *App) patchClientKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) loadClientKey(id int64) (*ClientKey, error) {
-	return scanClientKey(a.db.QueryRow("SELECT id,name,key_hint,enabled,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys WHERE id=?", id))
+	return scanClientKey(a.db.QueryRow("SELECT id,name,key_hint,enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys WHERE id=?", id))
 }
 
 func (a *App) deleteClientKey(w http.ResponseWriter, r *http.Request) {

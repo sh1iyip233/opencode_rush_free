@@ -1345,7 +1345,7 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 		Body: io.NopCloser(bytes.NewReader(payload)),
 	}
 	recorder := httptest.NewRecorder()
-	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now())
+	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now(), false)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
@@ -1378,7 +1378,7 @@ func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(stream)),
 	}
 	recorder := httptest.NewRecorder()
-	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond))
+	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond), false)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
@@ -1394,12 +1394,114 @@ func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream failed"}}`)),
 	}
-	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second))
+	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second), false)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
 	if errorFirstToken != nil {
 		t.Fatalf("error body recorded a first token latency: %v", *errorFirstToken)
+	}
+}
+
+func TestCopyResponseStripsReasoningContentFromJSON(t *testing.T) {
+	a := testApp(t)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"visible answer","reasoning_content":"private chain","reasoning_details":[{"text":"private detail"}]}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)),
+	}
+	recorder := httptest.NewRecorder()
+	usage, _, _, copyErr := a.copyResponse(recorder, resp, time.Now(), true)
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	if strings.Contains(recorder.Body.String(), "private") {
+		t.Fatalf("reasoning trace leaked to the client: %s", recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	choice := payload["choices"].([]any)[0].(map[string]any)
+	message := choice["message"].(map[string]any)
+	if message["content"] != "visible answer" {
+		t.Fatalf("final answer was changed: %#v", message)
+	}
+	if _, found := message["reasoning_content"]; found {
+		t.Fatalf("reasoning_content was not removed: %#v", message)
+	}
+	if usage == nil || usage.Total == nil || *usage.Total != 3 {
+		t.Fatalf("usage was not retained: %#v", usage)
+	}
+}
+
+func TestCopyResponseStripsReasoningContentFromSSE(t *testing.T) {
+	a := testApp(t)
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"private chain"}}]}`,
+		`data: {"choices":[{"delta":{"content":"visible answer","reasoning_content":"private continuation"}}]}`,
+		`data: {"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3},"choices":[]}`,
+		"data: [DONE]",
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(stream)),
+	}
+	recorder := httptest.NewRecorder()
+	usage, _, _, copyErr := a.copyResponse(recorder, resp, time.Now(), true)
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	response := recorder.Body.String()
+	if strings.Contains(response, "private") || strings.Contains(response, "reasoning_content") {
+		t.Fatalf("reasoning trace leaked to the client: %s", response)
+	}
+	if !strings.Contains(response, `"content":"visible answer"`) || !strings.Contains(response, "data: [DONE]") {
+		t.Fatalf("stream content was not retained: %s", response)
+	}
+	if usage == nil || usage.Total == nil || *usage.Total != 3 {
+		t.Fatalf("usage was not retained: %#v", usage)
+	}
+}
+
+func TestCopyResponseKeepsReasoningContentWhenThinkingWasNotDisabled(t *testing.T) {
+	a := testApp(t)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"answer","reasoning_content":"requested trace"}}]}`)),
+	}
+	recorder := httptest.NewRecorder()
+	_, _, _, copyErr := a.copyResponse(recorder, resp, time.Now(), false)
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	if !strings.Contains(recorder.Body.String(), "requested trace") {
+		t.Fatalf("reasoning trace was removed without an opt-out request: %s", recorder.Body.String())
+	}
+}
+
+func TestRequestDisablesThinking(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]any
+		want    bool
+	}{
+		{name: "DeepSeek disabled", payload: map[string]any{"thinking": map[string]any{"type": "disabled"}}, want: true},
+		{name: "DeepSeek case insensitive", payload: map[string]any{"thinking": map[string]any{"type": " DISABLED "}}, want: true},
+		{name: "Responses none", payload: map[string]any{"reasoning": map[string]any{"effort": "none"}}, want: true},
+		{name: "thinking enabled", payload: map[string]any{"thinking": map[string]any{"type": "enabled"}}, want: false},
+		{name: "low reasoning", payload: map[string]any{"reasoning": map[string]any{"effort": "low"}}, want: false},
+		{name: "no setting", payload: map[string]any{}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := requestDisablesThinking(tt.payload); got != tt.want {
+				t.Fatalf("requestDisablesThinking() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 

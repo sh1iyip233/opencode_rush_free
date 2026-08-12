@@ -1727,6 +1727,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientUserAgent := usageClientUserAgent(r)
+	suppressReasoning := requestDisablesThinking(requestPayload)
 	requestedModel := parsed.Model
 	resolvedModel, resolveErr := a.resolveModel(requestedModel)
 	if resolveErr != nil {
@@ -2009,7 +2010,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start)
+		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start, suppressReasoning)
 		var proxyID *int64
 		if p.ID > 0 {
 			proxyID = &p.ID
@@ -2033,6 +2034,20 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	lastErr, finalStatus, origin := terminalGatewayFailure(downstreamErr, lastErr)
 	a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", finalStatus, time.Since(start), nil, retryCount, nil, attemptSummary, clientUserAgent, parsed.Stream, lastErr, origin)
 	writeJSON(w, finalStatus, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
+}
+
+func requestDisablesThinking(payload map[string]any) bool {
+	if thinking, ok := payload["thinking"].(map[string]any); ok {
+		if mode, ok := thinking["type"].(string); ok && strings.EqualFold(strings.TrimSpace(mode), "disabled") {
+			return true
+		}
+	}
+	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && strings.EqualFold(strings.TrimSpace(effort), "none") {
+			return true
+		}
+	}
+	return false
 }
 
 func terminalGatewayFailure(requestErr, routeErr error) (error, int, string) {
@@ -2297,7 +2312,7 @@ func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, *http.Transport, err
 	}
 	return &http.Client{Transport: tr}, tr, nil
 }
-func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time) (*tokenUsage, string, *time.Duration, error) {
+func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time, suppressReasoning bool) (*tokenUsage, string, *time.Duration, error) {
 	defer resp.Body.Close()
 	blocked := make(map[string]struct{}, len(blockedDownstreamHeaders)+4)
 	for name := range blockedDownstreamHeaders {
@@ -2334,14 +2349,16 @@ func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt
 		buf := make([]byte, 32*1024)
 		flusher, _ := w.(http.Flusher)
 		detector := &sseContentDetector{}
+		filter := &sseReasoningFilter{enabled: suppressReasoning}
 		for {
 			n, err := resp.Body.Read(buf)
 			if n > 0 {
 				_, _ = captured.Write(buf[:n])
-				if detector.Observe(buf[:n]) {
+				filtered := filter.Filter(buf[:n])
+				if detector.Observe(filtered) {
 					markFirstToken()
 				}
-				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				if _, writeErr := w.Write(filtered); writeErr != nil {
 					copyErr = writeErr
 					break
 				}
@@ -2357,21 +2374,148 @@ func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt
 				break
 			}
 		}
+		if copyErr == nil {
+			filtered := filter.Flush()
+			if detector.Observe(filtered) {
+				markFirstToken()
+			}
+			if len(filtered) > 0 {
+				if _, writeErr := w.Write(filtered); writeErr != nil {
+					copyErr = writeErr
+				}
+			}
+		}
 		if detector.Flush() {
 			markFirstToken()
 		}
 	} else {
-		reader := io.Reader(resp.Body)
-		if resp.StatusCode < 400 {
-			reader = &firstByteReader{reader: reader, onFirstByte: markFirstToken}
+		if !suppressReasoning {
+			reader := io.Reader(resp.Body)
+			if resp.StatusCode < 400 {
+				reader = &firstByteReader{reader: reader, onFirstByte: markFirstToken}
+			}
+			_, copyErr = io.Copy(io.MultiWriter(w, captured), reader)
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			_, _ = captured.Write(body)
+			if resp.StatusCode < 400 && len(body) > 0 {
+				markFirstToken()
+			}
+			if readErr != nil {
+				copyErr = readErr
+			} else {
+				body = stripReasoningFromChatCompletion(body)
+				_, copyErr = w.Write(body)
+			}
 		}
-		_, copyErr = io.Copy(io.MultiWriter(w, captured), reader)
 	}
 	var summary string
 	if resp.StatusCode >= 400 {
 		summary = upstreamErrorSummary(captured.Bytes())
 	}
 	return parseUsageBytes(captured.Bytes()), summary, firstTokenLatency, copyErr
+}
+
+// stripReasoningFromChatCompletion removes upstream thinking traces only for
+// clients that explicitly disabled thinking in their request.
+func stripReasoningFromChatCompletion(body []byte) []byte {
+	var payload any
+	if json.Unmarshal(body, &payload) != nil || !stripReasoningFields(payload) {
+		return body
+	}
+	sanitized, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return sanitized
+}
+
+func stripReasoningFields(value any) bool {
+	changed := false
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"reasoning_content", "reasoning_details"} {
+			if _, found := typed[key]; found {
+				delete(typed, key)
+				changed = true
+			}
+		}
+		for _, nested := range typed {
+			if stripReasoningFields(nested) {
+				changed = true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if stripReasoningFields(nested) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+type sseReasoningFilter struct {
+	pending []byte
+	enabled bool
+}
+
+func (f *sseReasoningFilter) Filter(chunk []byte) []byte {
+	if !f.enabled {
+		return chunk
+	}
+	f.pending = append(f.pending, chunk...)
+	var filtered []byte
+	for {
+		newline := bytes.IndexByte(f.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		filtered = append(filtered, filterSSEReasoningLine(f.pending[:newline+1])...)
+		f.pending = f.pending[newline+1:]
+	}
+	return filtered
+}
+
+func (f *sseReasoningFilter) Flush() []byte {
+	if !f.enabled {
+		return nil
+	}
+	if len(f.pending) == 0 {
+		return nil
+	}
+	filtered := filterSSEReasoningLine(f.pending)
+	f.pending = nil
+	return filtered
+}
+
+func filterSSEReasoningLine(line []byte) []byte {
+	ending := []byte{}
+	body := line
+	if bytes.HasSuffix(body, []byte("\r\n")) {
+		ending = []byte("\r\n")
+		body = body[:len(body)-2]
+	} else if bytes.HasSuffix(body, []byte("\n")) {
+		ending = []byte("\n")
+		body = body[:len(body)-1]
+	}
+	trimmed := bytes.TrimSpace(body)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return line
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return line
+	}
+	var event any
+	if json.Unmarshal(payload, &event) != nil || !stripReasoningFields(event) {
+		return line
+	}
+	sanitized, err := json.Marshal(event)
+	if err != nil {
+		return line
+	}
+	return append(append([]byte("data: "), sanitized...), ending...)
 }
 
 type firstByteReader struct {

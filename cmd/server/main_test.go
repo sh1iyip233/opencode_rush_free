@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -740,6 +741,105 @@ func TestCanceledGatewayRequestIsExternalAndDoesNotPenalizeResin(t *testing.T) {
 	}
 	if len(statusPayload.Models) != 1 || statusPayload.Models[0].ExternalErrors24h != 1 || statusPayload.Models[0].SuccessRate != nil {
 		t.Fatalf("canceled request affected public availability: %#v", statusPayload.Models)
+	}
+}
+
+// proxyAccountName decodes the Resin account a proxied request was routed
+// through. Resin encodes the account in the proxy username as "platform.account".
+func proxyAccountName(r *http.Request) string {
+	const prefix = "Basic "
+	raw := r.Header.Get("Proxy-Authorization")
+	if !strings.HasPrefix(raw, prefix) {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, prefix))
+	if err != nil {
+		return ""
+	}
+	user, _, _ := strings.Cut(string(decoded), ":")
+	return user
+}
+
+func TestResinModeRetriesTransportFailureOnAFreshAccount(t *testing.T) {
+	a := testApp(t)
+	var mu sync.Mutex
+	accounts := []string{}
+	failed := false
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/chat/completions") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":[]}`)
+			return
+		}
+		mu.Lock()
+		accounts = append(accounts, proxyAccountName(r))
+		first := !failed
+		failed = true
+		mu.Unlock()
+		if first {
+			// The exit drops the tunnel before the upstream ever answers, which
+			// is what a "Bad Gateway" CONNECT failure looks like to the client.
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-retry","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`)
+	}))
+	defer proxy.Close()
+
+	pointLaneAt(t, "http://upstream.example.test")
+	upstream := httptest.NewRecorder()
+	a.putUpstream(upstream, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"http://upstream.example.test"}`)))
+	if upstream.Code != http.StatusOK {
+		t.Fatalf("configure upstream failed: %d %s", upstream.Code, upstream.Body.String())
+	}
+	engine := httptest.NewRecorder()
+	a.putProxyEngine(engine, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(`{"engine":"resin","resin_gateway_url":"`+proxy.URL+`","resin_platform":"Default","resin_proxy_token":"proxy-token"}`)))
+	if engine.Code != http.StatusOK {
+		t.Fatalf("configure Resin failed: %d %s", engine.Code, engine.Body.String())
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "retry:free", "Retry", 1, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("UPDATE settings SET value=? WHERE key='client_key'", hashToken("retry-test-client")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.migrateLegacyClientKey(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"retry:free","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Authorization", "Bearer retry-test-client")
+	response := httptest.NewRecorder()
+	a.gatewayChat(response, request)
+
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "recovered") {
+		t.Fatalf("a retryable exit failure was not retried: status=%d body=%s", response.Code, response.Body.String())
+	}
+	mu.Lock()
+	seen := append([]string(nil), accounts...)
+	mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("transport failure used %d attempts, want 2: %v", len(seen), seen)
+	}
+	if seen[0] == "" || seen[0] == seen[1] {
+		t.Fatalf("retry reused the account that lost the link: %v", seen)
+	}
+
+	var status, attempts string
+	var statusCode, retries int
+	if err := a.db.QueryRow("SELECT status,status_code,retry_count,COALESCE(attempt_summary,'') FROM usage_requests WHERE request_kind='chat' ORDER BY id DESC LIMIT 1").Scan(&status, &statusCode, &retries, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "success" || statusCode != http.StatusOK || retries != 1 {
+		t.Fatalf("usage row did not record the retry: status=%q code=%d retries=%d", status, statusCode, retries)
+	}
+	if n := strings.Count(attempts, `"proxy"`); n != 2 {
+		t.Fatalf("attempt summary recorded %d attempts, want 2: %s", n, attempts)
 	}
 }
 

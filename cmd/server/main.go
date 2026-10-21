@@ -79,6 +79,11 @@ const (
 	defaultUsageRetentionDays = 90
 	upstreamRequestTimeout    = 120 * time.Second
 	statusClientClosedRequest = 499
+	// gatewayRetryBudget bounds how long one request may spend rotating exits.
+	// Past it no new attempt is started and the last upstream status is relayed
+	// as-is, so a caller is never made to wait for a chain of retries that the
+	// gateway itself has already given up on.
+	gatewayRetryBudget = 25 * time.Second
 )
 
 var (
@@ -2011,6 +2016,15 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				if cfg.VisionUseProxy {
 					if resinMode {
 						a.resinFailure(helpErr)
+						// The helper failed on the account, not on the model, so
+						// rotate it and let the remaining attempts try a fresh
+						// exit instead of failing the whole request here.
+						if advanceErr := resinRoute.advance(a); advanceErr != nil {
+							log.Printf("advance Resin account failed: %v", advanceErr)
+						}
+						if i+1 < attempts && time.Since(start) < gatewayRetryBudget {
+							continue
+						}
 						break
 					}
 					if isProxyTransportError(helpErr) {
@@ -2100,7 +2114,23 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if resinMode {
 				a.resinFailure(e)
-				break
+				// The account that lost the link must also stop being sticky:
+				// rotate it, pace the loop and let the remaining attempts use a
+				// fresh exit. Breaking here turned a transient blip on one
+				// account into a client-visible 502 while most of the attempt
+				// budget was still unspent.
+				if advanceErr := resinRoute.advance(a); advanceErr != nil {
+					log.Printf("advance Resin account failed: %v", advanceErr)
+				}
+				if i+1 >= attempts || time.Since(start) >= gatewayRetryBudget {
+					break
+				}
+				if !waitForRetry(r.Context(), retryAfterDelay(nil, i)) {
+					downstreamErr = r.Context().Err()
+					lastErr = downstreamErr
+					break
+				}
+				continue
 			}
 			if isProxyTransportError(e) {
 				a.markProxyFailure(p.ID)
@@ -2147,10 +2177,20 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}
-			if i+1 < attempts {
+			// Rotating an account is cheap; keeping a caller waiting through ten
+			// back-to-back 429s is not. Once the retry budget is spent the
+			// upstream's own 429 is relayed, so the caller can decide for itself.
+			if i+1 < attempts && time.Since(start) < gatewayRetryBudget {
 				attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
 				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 				_ = resp.Body.Close()
+				// A 429 request never waited at all before, so ten rotations ran
+				// back-to-back and hammered the exit the gateway had just left.
+				if !waitForRetry(r.Context(), retryAfterDelay(resp, i)) {
+					downstreamErr = r.Context().Err()
+					lastErr = downstreamErr
+					break
+				}
 				continue
 			}
 		}

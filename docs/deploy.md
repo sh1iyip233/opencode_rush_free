@@ -48,7 +48,7 @@ docker --version && docker compose version
 ### 2.2 把代码弄到服务器
 
 ```bash
-git clone <你的仓库地址> /opt/relaydesk
+git clone https://github.com/sh1iyip233/opencode_rush_free.git /opt/relaydesk
 cd /opt/relaydesk
 ```
 

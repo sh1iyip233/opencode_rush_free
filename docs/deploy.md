@@ -276,6 +276,7 @@ docker compose up -d          # 或者 systemctl restart relaydesk
 1. **上游通道**（模型与网关 → 上游通道）
    - 上游地址和认证是**写死在程序里的**（OpenCode Zen 匿名免费通道），页面上只读展示，不用填、也不能改。
    - 想确认服务器能连上游，点「测试上游连通性」，直连和走代理各测一次。
+   - 免费通道有三道客户端校验：`stream: true`、请求体带 `bash`/`read` 工具、会话头是 `ses_` 官方格式。程序全部自动满足（非流式客户端会拿到折好的单个 JSON），不用你操心；两道 403 的区别见第 7 节排错表。
    - 有识图需求再填「图片辅助模型」那三项（独立供应商，走自己的地址和 key），没需求留空。
 2. **代理池**（Proxies）
    - 添加或批量导入。**批量导入是一行一个完整 URI**，不是 `host:port:user:pass` 那种冒号串：
@@ -362,6 +363,8 @@ docker compose logs --tail=100 opencode-proxy     # 或 journalctl -u relaydesk 
 | 上传图片 413 | nginx 请求体上限 | `client_max_body_size 32m;` |
 | 后台密码忘了 | 密码在库里，改 env 没用 | `sqlite3 app.db "DELETE FROM settings WHERE key='admin_hash';"` 然后重启，会用 env 里的 `ADMIN_PASSWORD` 重设 |
 | 所有出口都 401/403 | 上游在按模型拒你，不是代理坏了 | 同一个出口对同一个模型连续被拒 2 次就会被标记封禁，10 分钟后自动解除；换模型或补出口即可，界面暂时不展示这个状态 |
+| `403 This model is not available in your country` | 这个出口 IP 的地区不在免费通道开放范围（直连最容易撞） | 换地区出口再测；直连是服务器自己的 IP，改不了 |
+| `403 ... free tier can only be used from within OpenCode` | 请求形态不像官方客户端。免费通道要求三件事：`stream: true`、`tools` 里同时有 `bash` 和 `read`、会话头是 `ses_` 官方格式 | 程序已经自动整形（强制流式、补桩工具、铸会话号），所以再出现就说明这个出口 IP 已被上游标记，换出口或换 IP |
 
 ---
 

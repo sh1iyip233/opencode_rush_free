@@ -1386,12 +1386,16 @@ func (a *App) testUpstream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "refresh a free model first"})
 		return
 	}
+	// The lane only admits an agent-shaped streaming request, so the probe has to
+	// look like one: a bare non-streaming ping is refused with FreeTierError even
+	// from a perfectly good exit.
 	body, _ := json.Marshal(map[string]any{
 		"model":      model,
 		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
 		"max_tokens": 1,
-		"stream":     false,
+		"stream":     true,
 	})
+	body = ensureFreeLaneShape(body)
 	result := map[string]any{"model": model}
 	result["direct"] = a.testUpstreamRequest(r.Context(), cfg, body, nil)
 	p, engine, proxyErr := a.controlPlaneProxy()
@@ -1858,6 +1862,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	setCompressionHeaders(w, compression)
+	// The lane rejects a non-streaming request, so the upstream always sees
+	// stream:true. A client that asked for one JSON object gets one folded back
+	// out of the stream below, so the requirement never reaches the client.
+	forwardBody, clientStreaming := forceLaneStream(forwardBody)
 	if compression.Blocking {
 		detail := "compression gateway failed"
 		if compression.Err != nil {
@@ -2102,7 +2110,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start, suppressReasoning)
+		tokens, upstreamError, firstTokenLatency, copyErr := a.relayUpstreamResponse(w, resp, start, suppressReasoning, !clientStreaming)
 		if copyErr != nil && !resinMode && r.Context().Err() == nil && isProxyTransportError(copyErr) {
 			// The stream broke mid-flight. It is never replayed — the client has
 			// already received bytes — but the exit earns a transport strike so
@@ -2429,11 +2437,31 @@ func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, *http.Transport, err
 	}
 	return &http.Client{Transport: tr}, tr, nil
 }
+
+// copyResponse relays an upstream response unchanged, stream for stream.
 func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time, suppressReasoning bool) (*tokenUsage, string, *time.Duration, error) {
+	return a.relayUpstreamResponse(w, resp, startedAt, suppressReasoning, false)
+}
+
+// relayUpstreamResponse copies an upstream response downstream. When aggregate
+// is set and the upstream answers with an event stream, the stream is folded
+// into one JSON chat.completion instead of being relayed: the free lane only
+// accepts streaming requests, but a non-streaming client must still receive the
+// single object it asked for.
+func (a *App) relayUpstreamResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time, suppressReasoning, aggregate bool) (*tokenUsage, string, *time.Duration, error) {
 	defer resp.Body.Close()
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	streaming := strings.Contains(contentType, "text/event-stream")
+	aggregating := aggregate && streaming
 	blocked := make(map[string]struct{}, len(blockedDownstreamHeaders)+4)
 	for name := range blockedDownstreamHeaders {
 		blocked[name] = struct{}{}
+	}
+	if aggregating {
+		// The framing headers describe the stream, not the folded body.
+		blocked["content-type"] = struct{}{}
+		blocked["content-length"] = struct{}{}
+		blocked["transfer-encoding"] = struct{}{}
 	}
 	for _, value := range resp.Header.Values("Connection") {
 		for _, name := range strings.Split(value, ",") {
@@ -2450,8 +2478,10 @@ func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt
 			w.Header().Add(k, x)
 		}
 	}
+	if aggregating {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	w.WriteHeader(resp.StatusCode)
-	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	captured := &limitedCapture{limit: 2 << 20}
 	var firstTokenLatency *time.Duration
 	markFirstToken := func() {
@@ -2462,7 +2492,29 @@ func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt
 		firstTokenLatency = &latency
 	}
 	var copyErr error
-	if strings.Contains(contentType, "text/event-stream") {
+	if aggregating {
+		// The client asked for one object: drain the stream, fold it, and send it.
+		// First-token latency cannot be observed inside a single read, so it is
+		// reported as the time the whole stream took.
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+		_, _ = captured.Write(body)
+		if readErr != nil {
+			copyErr = readErr
+		} else {
+			if resp.StatusCode < 400 && len(body) > 0 {
+				markFirstToken()
+			}
+			if resp.StatusCode < 400 {
+				if folded, foldErr := aggregateSSEStream(body); foldErr == nil {
+					if suppressReasoning {
+						folded = stripReasoningFromChatCompletion(folded)
+					}
+					body = folded
+				}
+			}
+			_, copyErr = w.Write(body)
+		}
+	} else if streaming {
 		buf := make([]byte, 32*1024)
 		flusher, _ := w.(http.Flusher)
 		detector := &sseContentDetector{}

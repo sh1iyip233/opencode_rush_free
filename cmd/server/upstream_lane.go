@@ -391,3 +391,25 @@ func ensureFreeLaneShape(body []byte) []byte {
 	}
 	return shaped
 }
+
+// forceLaneStream rewrites a chat-completions body so the upstream sees
+// stream:true. The anonymous lane refuses a non-streaming request outright
+// (gate probed 2026-10-09: "stream: true — non-stream 403s"), so the shape must
+// hold for every caller, not just streaming ones. The reported bool is what the
+// client asked for, so the relay can fold the stream back into one JSON object
+// for a client that did not want a stream.
+func forceLaneStream(body []byte) ([]byte, bool) {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return body, false
+	}
+	if wanted, _ := payload["stream"].(bool); wanted {
+		return body, true
+	}
+	payload["stream"] = true
+	shaped, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return shaped, false
+}

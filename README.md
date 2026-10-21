@@ -9,7 +9,7 @@
   </p>  
 </div>
 
-Relay Desk 使用单实例 Go + SQLite，支持上游模型、HTTP/HTTPS/SOCKS5 代理池、Resin 路由、Client Key、模型别名、探测、统计和 Webhook 告警。
+Relay Desk 使用单实例 Go + SQLite，支持上游模型、HTTP/HTTPS/SOCKS5 代理池、Resin 路由、Client Key、模型别名、探测、统计、Webhook 告警，以及可自由配置摘要 AI 接口的[上下文压缩网关](docs/compression.md)。
 
 ## 快速开始
 
@@ -62,13 +62,14 @@ SESSION_SECRET=至少32个字符的随机密钥
 ## 首次配置
 
 1. 使用 `ADMIN_PASSWORD` 登录管理台。
-2. 上游是内置的 OpenCode Zen 匿名免费通道，地址与认证写死在程序里，无需配置；只需确认「测试上游连通性」能通。
+2. 上游是内置的 OpenCode Zen 匿名免费通道，地址与认证写死在程序里，无需配置；只需确认「测试上游连通性」能通。免费通道要求请求呈「官方客户端形态」（流式 + `bash`/`read` 工具 + `ses_` 会话头），程序自动整形，非流式客户端也会拿回一个折好的 JSON。
 3. 添加代理，或选择 Resin 路由。
 4. 刷新模型，按需启停模型或创建别名。
 5. 在“模型与网关”页复制客户端 Base URL；在“客户端 Key”区域创建 Client Key，并将两者配置到 OpenCode：
    ```text
    http(s)://服务器地址:端口/v1
    ```
+6. 可选：在“压缩网关”页配置摘要 AI 接口（OpenAI 兼容或 Anthropic Messages），长会话会自动折叠较早消息。详见 [docs/compression.md](docs/compression.md)。
 
 Resin 故障时保持 Resin 路由并返回错误，不会自动降级到内置代理池。旧版 `settings.client_key` 会自动迁移为 `Legacy` Key；旧 Key 只有哈希时无法恢复明文，需要在控制台中轮换。
 
@@ -87,6 +88,8 @@ POST /v1/chat/completions
 Authorization: Bearer <client-key>
 Content-Type: application/json
 ```
+
+压缩网关启用后，响应会带 `X-Relay-Compression`、`X-Relay-Compression-Reason`、`X-Relay-Compression-Saved-Tokens` 等头说明本次折叠情况；请求时带 `X-Relay-Compression: off` 可对单次调用关闭压缩，带 `force` 可强制压缩。细节见 [docs/compression.md](docs/compression.md)。
 
 请求示例：
 
@@ -109,6 +112,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 代理         | `/api/proxies`、`/api/proxies/import`、`/api/proxy-probes`                         |
 | 统计         | `/api/stats/*`、`/api/usage/*`                                                    |
 | 告警         | `/api/settings/alerts`                                                           |
+| 压缩网关       | `/api/settings/compression`、`/api/compression/stats`、`/api/compression/sessions`、`/api/compression/preview` |
 
 ## 公网部署与备份
 

@@ -30,6 +30,17 @@ const (
 	resinFailureThreshold       = 3
 	resinMaxAttempts            = 10
 	resinControlPlaneAccountKey = "relaydesk-control-plane"
+	// A Resin account is a sticky exit: once the upstream answers 429 for it,
+	// drawing the same account again spends a full attempt (seconds of upstream
+	// latency) on an exit that is already known to be limited. The floor keeps
+	// a short or missing Retry-After from putting it straight back in rotation;
+	// the ceiling stops one bad response from parking an exit for the day.
+	resinAccountCooldownFloor = 45 * time.Second
+	resinAccountCooldownCeil  = 5 * time.Minute
+	// How many alternative accounts one draw may probe before it gives up and
+	// reuses a cooling one, and how many cooled accounts are remembered.
+	resinAccountProbeLimit = 8
+	resinAccountCoolLimit  = 4096
 )
 
 type proxyEngineConfig struct {
@@ -57,6 +68,8 @@ type proxyEngineStatus struct {
 	ResinLastCheckedAt  *time.Time `json:"resin_last_checked_at,omitempty"`
 	ResinLastCheckError string     `json:"resin_last_check_error,omitempty"`
 	ResinHealth         string     `json:"resin_health"`
+	// ResinCooledAccounts is how many exits are parked after a 429 right now.
+	ResinCooledAccounts int `json:"resin_cooled_accounts"`
 }
 
 func settingValue(db *sql.DB, key string) (string, error) {
@@ -212,6 +225,7 @@ func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 		ResinLastCheckedAt:  cfg.LastCheckedAt,
 		ResinLastCheckError: cfg.LastCheckError,
 		ResinHealth:         health,
+		ResinCooledAccounts: a.cooledResinAccounts(),
 	}, nil
 }
 
@@ -351,10 +365,19 @@ func (a *App) resinProxyForSession(sessionKey string) (ProxyRecord, error) {
 // resinRequestRoute keeps account rotation local to a request when the client
 // does not provide a session ID. Persisted session routes retain their existing
 // sticky behavior, while anonymous requests avoid creating unbounded DB rows.
+//
+// A route also remembers which exit it last used so the gateway can learn from
+// a 429: the account that answered 429 is parked in the cooldown table, and the
+// next draw skips it instead of spending a slow attempt on it again.
 type resinRequestRoute struct {
 	sessionKey          string
 	ephemeralSeed       string
 	ephemeralGeneration uint64
+	// retryNonce re-randomizes the account name without touching the sticky
+	// session generation, so a retry re-rolls the exit instead of walking to
+	// the next one (which can stay inside the same limited pool bucket).
+	retryNonce  string
+	lastAccount string
 }
 
 func newResinRequestRoute(sessionKey string) (*resinRequestRoute, error) {
@@ -370,18 +393,47 @@ func newResinRequestRoute(sessionKey string) (*resinRequestRoute, error) {
 	return route, nil
 }
 
+// baseAccount is the sticky identity for this request: the persisted session
+// route, or the seed and generation of an anonymous one.
+func (route *resinRequestRoute) baseAccount(a *App) (string, error) {
+	if route.sessionKey != "" {
+		return a.nextResinAccount(route.sessionKey)
+	}
+	return hashToken(route.ephemeralSeed + "\x00" + strconv.FormatUint(route.ephemeralGeneration, 10)), nil
+}
+
+// accountFor folds the retry nonce into the sticky identity, so the first
+// attempt of a session keeps its cached exit while a retry is unrelated to it.
+func (route *resinRequestRoute) accountFor(base string) string {
+	if route.retryNonce == "" {
+		return base
+	}
+	return hashToken(base + "\x00" + route.retryNonce)
+}
+
 func (route *resinRequestRoute) proxy(a *App, cfg proxyEngineConfig) (ProxyRecord, error) {
 	if route == nil {
 		return ProxyRecord{}, errors.New("Resin request route is not initialized")
 	}
-	if route.sessionKey != "" {
-		account, err := a.nextResinAccount(route.sessionKey)
-		if err != nil {
-			return ProxyRecord{}, err
-		}
-		return a.resinProxy(cfg, account)
+	base, err := route.baseAccount(a)
+	if err != nil {
+		return ProxyRecord{}, err
 	}
-	account := hashToken(route.ephemeralSeed + "\x00" + strconv.FormatUint(route.ephemeralGeneration, 10))
+	account := route.accountFor(base)
+	// Skip every account the gateway has just seen a 429 for. Probing is local:
+	// it costs a hash, not an upstream round trip.
+	for probes := 0; probes < resinAccountProbeLimit; probes++ {
+		if _, cooling := a.resinAccountCooling(account); !cooling {
+			break
+		}
+		nonce, nonceErr := randomKey()
+		if nonceErr != nil {
+			break
+		}
+		route.retryNonce = nonce
+		account = route.accountFor(base)
+	}
+	route.lastAccount = account
 	return a.resinProxy(cfg, account)
 }
 
@@ -389,11 +441,114 @@ func (route *resinRequestRoute) advance(a *App) error {
 	if route == nil {
 		return errors.New("Resin request route is not initialized")
 	}
+	nonce, err := randomKey()
+	if err != nil {
+		return err
+	}
+	route.retryNonce = nonce
 	if route.sessionKey != "" {
 		return a.advanceResinAccount(route.sessionKey)
 	}
 	route.ephemeralGeneration++
 	return nil
+}
+
+// resinAccountOf returns the account name a proxy record was built from.
+func resinAccountOf(p ProxyRecord) string {
+	if _, account, ok := strings.Cut(p.Username, "."); ok {
+		return account
+	}
+	return p.Username
+}
+
+// resinAccountCooling reports how long an account is still parked. An expired
+// entry is dropped on read, so the table cleans itself under load.
+func (a *App) resinAccountCooling(account string) (time.Duration, bool) {
+	if account == "" {
+		return 0, false
+	}
+	now := time.Now()
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	until, ok := a.resinCooledAccounts[account]
+	if !ok {
+		return 0, false
+	}
+	if !until.After(now) {
+		delete(a.resinCooledAccounts, account)
+		return 0, false
+	}
+	return until.Sub(now), true
+}
+
+// coolResinAccount parks one account for the requested time, clamped so a bad
+// or missing Retry-After can neither un-park it immediately nor park it for the
+// rest of the day.
+func (a *App) coolResinAccount(account string, cooldown time.Duration) {
+	if account == "" {
+		return
+	}
+	if cooldown < resinAccountCooldownFloor {
+		cooldown = resinAccountCooldownFloor
+	}
+	if cooldown > resinAccountCooldownCeil {
+		cooldown = resinAccountCooldownCeil
+	}
+	until := time.Now().Add(cooldown)
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	if a.resinCooledAccounts == nil {
+		a.resinCooledAccounts = make(map[string]time.Time)
+	}
+	if len(a.resinCooledAccounts) >= resinAccountCoolLimit {
+		for key, expiry := range a.resinCooledAccounts {
+			if !expiry.After(time.Now()) {
+				delete(a.resinCooledAccounts, key)
+			}
+		}
+		if len(a.resinCooledAccounts) >= resinAccountCoolLimit {
+			// Still full of live entries: forget the one that frees up first.
+			var oldestKey string
+			var oldest time.Time
+			for key, expiry := range a.resinCooledAccounts {
+				if oldestKey == "" || expiry.Before(oldest) {
+					oldestKey, oldest = key, expiry
+				}
+			}
+			delete(a.resinCooledAccounts, oldestKey)
+		}
+	}
+	a.resinCooledAccounts[account] = until
+}
+
+// releaseResinAccount clears a park as soon as the same exit answers well
+// again, so a recovered account does not sit out the rest of its cooldown.
+func (a *App) releaseResinAccount(account string) {
+	if account == "" {
+		return
+	}
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	delete(a.resinCooledAccounts, account)
+}
+
+// cooledResinAccounts reports how many exits are parked right now.
+func (a *App) cooledResinAccounts() int {
+	now := time.Now()
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	count := 0
+	for _, until := range a.resinCooledAccounts {
+		if until.After(now) {
+			count++
+		}
+	}
+	return count
+}
+
+// resinAccountCooldownFor turns the upstream's Retry-After into a park time.
+func resinAccountCooldownFor(resp *http.Response) time.Duration {
+	return retryAfterDuration(resp)
 }
 
 func (a *App) resinControlPlaneProxy() (ProxyRecord, error) {

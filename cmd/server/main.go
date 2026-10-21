@@ -48,6 +48,8 @@ type App struct {
 	resinLastSuccessPersist time.Time
 	resinProbeMu            sync.Mutex
 	resinLastAutoProbe      time.Time
+	resinCoolMu             sync.Mutex
+	resinCooledAccounts     map[string]time.Time
 	gatewaySem              chan struct{}
 	rr                      atomic.Uint64
 	proxyRuntime            *proxyRuntime
@@ -2069,6 +2071,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
 				if cfg.VisionUseProxy && i+1 < attempts && (helpStatus == http.StatusTooManyRequests || helpStatus == http.StatusUnauthorized || helpStatus == http.StatusForbidden) {
 					if resinMode {
+						if helpStatus == http.StatusTooManyRequests {
+							a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(helpResp))
+						}
 						_ = resinRoute.advance(a)
 					} else {
 						if classifyUpstreamOutcome(helpStatus) == upstreamOutcomeRefused {
@@ -2140,6 +2145,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if resinMode {
 			a.resinSuccess()
+			if resp.StatusCode < http.StatusBadRequest {
+				// The exit answered: whatever it was parked for is over.
+				a.releaseResinAccount(resinRoute.lastAccount)
+			}
 		} else {
 			switch classifyUpstreamOutcome(resp.StatusCode) {
 			case upstreamOutcomeSuccess:
@@ -2174,6 +2183,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && resinMode {
+			// Park the exit that answered 429 before rotating: the next draw must
+			// not land on it again, and neither must the next request.
+			a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(resp))
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}

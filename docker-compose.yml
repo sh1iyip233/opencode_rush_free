@@ -21,12 +21,16 @@ services:
       volume-init:
         condition: service_completed_successfully
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
+      # Publish the port the app actually listens on: the container reads PORT
+      # from .env as well, so a custom PORT must appear on both sides. Pinning
+      # the container side to 8080 publishes a port nothing listens on.
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:${PORT:-8080}"
     env_file:
       - .env
     environment:
       WEB_DIR: /app/web/dist
       DATABASE_PATH: /data/app.db
+      PORT: "${PORT:-8080}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -40,7 +44,7 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${PORT:-8080}/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3

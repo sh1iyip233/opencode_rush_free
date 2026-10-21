@@ -3,6 +3,8 @@
 这份文档只讲一件事：怎么把这个网关跑在你自己的 Linux 服务器上，并且能长期活着。
 不解释架构，不讲原理，照着做就行。末尾有出问题时该看哪儿。
 
+> **关于端口**：本文统一按 `PORT=6320` 举例（这是当前部署在用的端口）。你 `.env` 里写多少，本文里的 `6320` 就是多少——如果哪天改了端口，把全文的 `6320` 一起替换掉，尤其是 **nginx 的 `proxy_pass`、`ufw` 规则、健康检查地址**这三处，漏一处就会「服务是好的但访问不到」。
+
 ---
 
 ## 0. 先搞清楚你要部署的是什么
@@ -10,7 +12,7 @@
 - **一个 Go 程序**（`opencode-proxy`）+ **一堆前端静态文件**（`web/dist`）+ **一个 SQLite 数据库文件**。
 - 没有 MySQL、没有 Redis、没有别的中间件。数据库就是 `/data/app.db` 这一个文件。
 - 程序**自己不处理 HTTPS**。公网访问要在前面挂 nginx（第 4 节）。
-- 程序**入站**只开一个端口（默认 8080）；**出站**要能连到你的代理池和上游 API。
+- 程序**入站**只开一个端口（本文按 6320 举例，默认值是 8080）；**出站**要能连到你的代理池和上游 API。
 - 服务器最低配：1 核 512M 够跑，推荐 1 核 1G。系统 Debian 12 / Ubuntu 22.04 及以上都行。
 
 ---
@@ -68,13 +70,13 @@ ADMIN_PASSWORD=把第1节生成的那个16字节随机串填进来
 APP_ENCRYPTION_KEY=把第1节生成的那个32字节随机串填进来
 SESSION_SECRET=把第1节生成的那个32字节随机串填进来
 
-PORT=8080
+PORT=6320
 BIND_ADDRESS=127.0.0.1
 COOKIE_SECURE=false
 MAX_CONCURRENT_REQUESTS=100
 ```
 
-`BIND_ADDRESS=127.0.0.1` 的意思是「只在宿主机本地监听 8080，外面进不来，必须经过 nginx」。这是对的，别改成 `0.0.0.0` 图省事。
+`BIND_ADDRESS=127.0.0.1` 的意思是「只在宿主机本地监听 6320，外面进不来，必须经过 nginx」。这是对的，别改成 `0.0.0.0` 图省事。
 
 ### 2.4 启动
 
@@ -87,7 +89,7 @@ docker compose logs -f opencode-proxy   # 看日志，Ctrl+C 退出
 ### 2.5 验证
 
 ```bash
-curl -s localhost:8080/healthz
+curl -s localhost:6320/healthz
 # {"status":"ok"}
 ```
 
@@ -145,7 +147,7 @@ cat > /etc/relaydesk.env <<'EOF'
 ADMIN_PASSWORD=第1节的16字节随机串
 APP_ENCRYPTION_KEY=第1节的32字节随机串
 SESSION_SECRET=第1节的32字节随机串
-PORT=8080
+PORT=6320
 DATABASE_PATH=/var/lib/relaydesk/app.db
 WEB_DIR=/opt/relaydesk/web/dist
 COOKIE_SECURE=false
@@ -194,12 +196,12 @@ journalctl -u relaydesk -f        # 看实时日志
 
 ### 3.5 裸机部署必须注意的一件事
 
-这个程序**只认 `PORT`，不认 `BIND_ADDRESS`**，所以它监听的是 `0.0.0.0:8080`——所有网卡都开着。
+这个程序**只认 `PORT`，不认 `BIND_ADDRESS`**，所以它监听的是 `0.0.0.0:6320`——所有网卡都开着。
 所以一定要做下面两件事之一（两个都做最好）：
 
 ```bash
-# 只允许本机访问 8080（有 nginx 反代时这样做）
-ufw deny 8080
+# 只允许本机访问 6320（有 nginx 反代时这样做）
+ufw deny 6320
 # 或者干脆只放行 22/80/443
 ufw allow 22 && ufw allow 80 && ufw allow 443 && ufw enable
 ```
@@ -227,7 +229,7 @@ server {
     client_max_body_size 32m;          # 请求体可能带图片，别用默认的 1m
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:6320;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -279,7 +281,7 @@ docker compose up -d          # 或者 systemctl restart relaydesk
 2. **代理池**（Proxies）
    - 添加或批量导入。**批量导入是一行一个完整 URI**，不是 `host:port:user:pass` 那种冒号串：
      ```
-     http://user:pass@1.2.3.4:8080
+     http://user:pass@1.2.3.4:3128
      socks5://user:pass@5.6.7.8:1080
      http://9.9.9.9:3128          ← 没有账号密码就省略 user:pass@
      ```
@@ -352,6 +354,8 @@ docker compose logs --tail=100 opencode-proxy     # 或 journalctl -u relaydesk 
 | 容器起不来 | `APP_ENCRYPTION_KEY must contain at least 32 characters` | 密钥不够 32 字符，重新生成 |
 | 容器起不来 | `ADMIN_PASSWORD is required for first startup` | 首次启动没填密码，或者填了 `admin`/占位符 |
 | 打开是白页 / 404 | 日志没有报错，但 `WEB_DIR` 指错了 | 确认 `web/dist/index.html` 真的存在 |
+| 容器显示 `unhealthy`，但程序日志一切正常 | `PORT` 改了、但 compose 的端口映射还写着 `:8080`，容器里监听 6320，外面却往 8080 打 | `docker-compose.yml` 里 `ports` 的两边都要用 `${PORT}`（已修）；改完 `docker compose up -d` |
+| 浏览器连不上，`curl localhost:6320` 也不通 | 服务没起在 6320 上，或者防火墙挡了 | `ss -lntp \| grep 6320` 看有没有监听；`ufw status` 看规则 |
 | 登录成功又跳回登录页 | `COOKIE_SECURE=true` 但访问的是 http | 上 HTTPS，或者临时改回 `false` |
 | 请求返回 503 `no healthy proxies available` | 代理全在冷却/过期/停用 | 去代理页跑探测；刚冷却的出口 1~30 分钟会自动回池 |
 | 请求返回 502 `all proxies failed` | 上游 key 或 base_url 错，或者代理全挂 | 点「测试上游」；看详情里的 attempt 记录 |
@@ -369,9 +373,9 @@ docker compose logs --tail=100 opencode-proxy     # 或 journalctl -u relaydesk 
 - [ ] `APP_ENCRYPTION_KEY` / `SESSION_SECRET` 都是随机生成、≥32 字符、已抄进密码管理器
 - [ ] `ADMIN_PASSWORD` 不是 `admin`，不是占位符
 - [ ] `.env` 权限 600，没有提交进 git
-- [ ] `curl localhost:8080/healthz` 返回 `{"status":"ok"}`
+- [ ] `curl localhost:6320/healthz` 返回 `{"status":"ok"}`
 - [ ] nginx 里写了 `proxy_buffering off` 和 `client_max_body_size`
 - [ ] 上了 HTTPS 且 `COOKIE_SECURE=true`
-- [ ] 8080 端口没有直接暴露在公网
+- [ ] 6320 端口没有直接暴露在公网
 - [ ] 后台里：上游测试通过 → 代理探测全绿 → 客户端 key 已创建并试过 `/v1/models`
 - [ ] 备份跑过一次，且知道 `APP_ENCRYPTION_KEY` 存在哪

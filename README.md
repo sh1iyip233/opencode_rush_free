@@ -25,6 +25,8 @@ curl http://127.0.0.1:8080/healthz
 
 管理台和网关默认地址：`http://127.0.0.1:8080`
 
+`.env` 里的 `PORT` 改成别的（例如 `6320`）时，`docker compose` 的端口映射和健康检查会跟着走，访问地址也要一起换成 `http://127.0.0.1:6320`。详细的服务器部署步骤见 [docs/deploy.md](docs/deploy.md)。
+
 ### 本地开发
 
 ```bash

@@ -124,6 +124,11 @@ type ProxyEngine = {
   resin_last_checked_at?: string;
   resin_last_check_error?: string;
   resin_health?: "unknown" | "healthy" | "degraded";
+  resin_cooled_accounts?: number;
+  resin_breaker_open?: boolean;
+  resin_retry_budget_seconds?: number;
+  resin_breaker_threshold?: number;
+  resin_breaker_cooldown_seconds?: number;
 };
 type ToastType = "success" | "warning" | "error";
 type Toast = { message: string; type: ToastType };
@@ -1127,6 +1132,9 @@ function Proxies({
   const [resinPlatform, setResinPlatform] = useState("Default");
   const [resinToken, setResinToken] = useState("");
   const [resinTokenDirty, setResinTokenDirty] = useState(false);
+  const [resinRetryBudget, setResinRetryBudget] = useState("45");
+  const [resinBreakerThreshold, setResinBreakerThreshold] = useState("12");
+  const [resinBreakerCooldown, setResinBreakerCooldown] = useState("30");
   const [resinResult, setResinResult] = useState<any>(null);
   const [importResults, setImportResults] = useState<ImportResult[]>([]);
   const [probeJob, setProbeJob] = useState<ProbeJob | null>(null);
@@ -1166,6 +1174,9 @@ function Proxies({
       setEngineConfig(next);
       setResinGatewayURL(next.resin_gateway_url || "");
       setResinPlatform(next.resin_platform || "Default");
+      setResinRetryBudget(String(next.resin_retry_budget_seconds ?? 45));
+      setResinBreakerThreshold(String(next.resin_breaker_threshold ?? 12));
+      setResinBreakerCooldown(String(next.resin_breaker_cooldown_seconds ?? 30));
       setResinToken("");
       setResinTokenDirty(false);
       return true;
@@ -1334,6 +1345,23 @@ function Proxies({
     };
   }, [loadProxies, notify, pageSize, probeJob, proxyPage]);
   const saveEngine = async (nextEngine = engineConfig.engine) => {
+    const retryBudget = Number(resinRetryBudget);
+    const breakerThreshold = Number(resinBreakerThreshold);
+    const breakerCooldown = Number(resinBreakerCooldown);
+    if (nextEngine === "resin") {
+      if (!Number.isInteger(retryBudget) || retryBudget < 10 || retryBudget > 180) {
+        notify("429 重试预算需为 10 到 180 之间的整数");
+        return;
+      }
+      if (!Number.isInteger(breakerThreshold) || breakerThreshold < 3 || breakerThreshold > 100) {
+        notify("熔断阈值需为 3 到 100 之间的整数");
+        return;
+      }
+      if (!Number.isInteger(breakerCooldown) || breakerCooldown < 5 || breakerCooldown > 300) {
+        notify("熔断冷却需为 5 到 300 之间的整数");
+        return;
+      }
+    }
     setBusy(true);
     try {
       const payload: Record<string, unknown> = {
@@ -1341,6 +1369,11 @@ function Proxies({
         resin_gateway_url: resinGatewayURL,
         resin_platform: resinPlatform,
       };
+      if (nextEngine === "resin") {
+        payload.resin_retry_budget_seconds = retryBudget;
+        payload.resin_breaker_threshold = breakerThreshold;
+        payload.resin_breaker_cooldown_seconds = breakerCooldown;
+      }
       if (resinTokenDirty) payload.resin_proxy_token = resinToken;
       const next = (await api("/api/settings/proxy-engine", {
         method: "PUT",
@@ -1433,6 +1466,42 @@ function Proxies({
                   autoComplete="off"
                 />
               </label>
+              <label>
+                429 重试预算（秒）
+                <input
+                  type="number"
+                  min="10"
+                  max="180"
+                  value={resinRetryBudget}
+                  onChange={(event) => setResinRetryBudget(event.target.value)}
+                />
+                <small className="field-help">
+                  单个请求最多为 429 换多少次出口；预算内的 429 由网关吸收。
+                </small>
+              </label>
+              <label>
+                熔断阈值（连续 429 次数）
+                <input
+                  type="number"
+                  min="3"
+                  max="100"
+                  value={resinBreakerThreshold}
+                  onChange={(event) => setResinBreakerThreshold(event.target.value)}
+                />
+                <small className="field-help">
+                  达到阈值即进入快速失败，避免重试放大限流。
+                </small>
+              </label>
+              <label>
+                熔断冷却（秒）
+                <input
+                  type="number"
+                  min="5"
+                  max="300"
+                  value={resinBreakerCooldown}
+                  onChange={(event) => setResinBreakerCooldown(event.target.value)}
+                />
+              </label>
               <label className="resin-token-field">
                 代理令牌
                 <input
@@ -1460,6 +1529,12 @@ function Proxies({
               Resin 状态：{engineConfig.resin_health === "healthy" ? "健康" : engineConfig.resin_health === "degraded" ? "不可达或异常" : "尚未检测"}
               {engineConfig.resin_last_checked_at ? ` · ${new Date(engineConfig.resin_last_checked_at).toLocaleString()}` : ""}
               {engineConfig.resin_last_check_error ? ` · ${engineConfig.resin_last_check_error}` : ""}
+            </div>
+            <div className={`resin-state ${engineConfig.resin_breaker_open ? "error-line" : "muted"}`}>
+              {engineConfig.resin_breaker_open
+                ? "429 熔断中：出口池饱和，当前直接快速失败"
+                : `429 策略：预算 ${engineConfig.resin_retry_budget_seconds ?? 45}s · 阈值 ${engineConfig.resin_breaker_threshold ?? 12} 次 · 冷却 ${engineConfig.resin_breaker_cooldown_seconds ?? 30}s`}
+              {` · 冷却中的出口 ${engineConfig.resin_cooled_accounts ?? 0} 个`}
             </div>
             {resinResult && (
               <div className={`test-result ${resinResult.ok ? "ok" : "bad"}`}>

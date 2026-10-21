@@ -50,6 +50,10 @@ type App struct {
 	resinLastAutoProbe      time.Time
 	resinCoolMu             sync.Mutex
 	resinCooledAccounts     map[string]time.Time
+	resinBreakerMu          sync.Mutex
+	resinBreakerHits        int
+	resinBreakerSince       time.Time
+	resinBreakerOpenUntil   time.Time
 	gatewaySem              chan struct{}
 	rr                      atomic.Uint64
 	proxyRuntime            *proxyRuntime
@@ -1957,6 +1961,30 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	// banned set is loaded per request and only used to order candidates.
 	banned := a.bannedProxyIDs(resolvedModel)
 	attemptSummary := []map[string]any{}
+	// One request may keep drawing fresh exits while the pool answers 429, but
+	// only for a bounded budget: past it the caller is told to come back later.
+	// The breaker covers the other failure mode — a pool so saturated that
+	// retrying would lengthen the limit instead of escaping it.
+	resinBudget := gatewayRetryBudget
+	if resinMode {
+		resinBudget = a.resinRetryBudget()
+		if a.resinBreakerOpenNow() {
+			// Answer at once with the same 429 the budget would eventually
+			// produce, so clients back off instead of holding a connection and
+			// feeding the storm with retries of their own.
+			a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, nil, "", routeEngine, "error", http.StatusTooManyRequests, time.Since(start), nil, 0, nil, attemptSummary, clientUserAgent, parsed.Stream, errors.New("resin breaker open: pool saturated with 429"))
+			traceSet(r, "stage", "resin_breaker_open")
+			traceSet(r, "status_code", http.StatusTooManyRequests)
+			traceSet(r, "error_origin", "upstream")
+			waitSeconds := int(a.resinBreakerRemaining().Round(time.Second) / time.Second)
+			if waitSeconds < 1 {
+				waitSeconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(waitSeconds))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "upstream rate limited", "detail": "the exit pool is saturated; retry shortly"})
+			return
+		}
+	}
 	for i := 0; i < attempts; i++ {
 		if requestErr := r.Context().Err(); requestErr != nil {
 			downstreamErr = requestErr
@@ -2073,6 +2101,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 					if resinMode {
 						if helpStatus == http.StatusTooManyRequests {
 							a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(helpResp))
+							a.noteResinLimited()
 						}
 						_ = resinRoute.advance(a)
 					} else {
@@ -2146,8 +2175,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if resinMode {
 			a.resinSuccess()
 			if resp.StatusCode < http.StatusBadRequest {
-				// The exit answered: whatever it was parked for is over.
+				// The exit answered: whatever it was parked for is over, and one
+				// success proves the pool is moving again.
 				a.releaseResinAccount(resinRoute.lastAccount)
+				a.noteResinHealthy()
 			}
 		} else {
 			switch classifyUpstreamOutcome(resp.StatusCode) {
@@ -2186,13 +2217,15 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			// Park the exit that answered 429 before rotating: the next draw must
 			// not land on it again, and neither must the next request.
 			a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(resp))
+			a.noteResinLimited()
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}
 			// Rotating an account is cheap; keeping a caller waiting through ten
-			// back-to-back 429s is not. Once the retry budget is spent the
-			// upstream's own 429 is relayed, so the caller can decide for itself.
-			if i+1 < attempts && time.Since(start) < gatewayRetryBudget {
+			// back-to-back 429s is not. The request keeps trying until its own
+			// budget runs out — the intermediate 429s are ours to absorb — and
+			// only then relays the upstream's 429 so the caller can back off.
+			if i+1 < attempts && time.Since(start) < resinBudget {
 				attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
 				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 				_ = resp.Body.Close()

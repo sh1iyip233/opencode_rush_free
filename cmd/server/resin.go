@@ -17,19 +17,36 @@ const (
 	proxyEngineBuiltin = "builtin"
 	proxyEngineResin   = "resin"
 
-	proxyEngineSettingKey       = "proxy_engine"
-	resinGatewayURLSettingKey   = "resin_gateway_url"
-	resinProxyTokenSettingKey   = "resin_proxy_token"
-	resinPlatformSettingKey     = "resin_platform"
-	resinFallbackActiveSetting  = "resin_fallback_active"
-	resinFallbackSinceSetting   = "resin_fallback_since"
-	resinFallbackReasonSetting  = "resin_fallback_reason"
-	resinLastCheckedAtSetting   = "resin_last_checked_at"
-	resinLastCheckErrorSetting  = "resin_last_check_error"
-	resinFailureWindow          = 30 * time.Second
-	resinFailureThreshold       = 3
-	resinMaxAttempts            = 10
-	resinControlPlaneAccountKey = "relaydesk-control-plane"
+	proxyEngineSettingKey      = "proxy_engine"
+	resinGatewayURLSettingKey  = "resin_gateway_url"
+	resinProxyTokenSettingKey  = "resin_proxy_token"
+	resinPlatformSettingKey    = "resin_platform"
+	resinFallbackActiveSetting = "resin_fallback_active"
+	resinFallbackSinceSetting  = "resin_fallback_since"
+	resinFallbackReasonSetting = "resin_fallback_reason"
+	resinLastCheckedAtSetting  = "resin_last_checked_at"
+	resinLastCheckErrorSetting = "resin_last_check_error"
+	// Operator knobs for the 429 policy. The budget is how long one request may
+	// keep drawing fresh exits before the caller is told to come back later;
+	// the breaker is the point at which the pool is considered saturated and
+	// the gateway stops retrying so it does not amplify the storm.
+	resinRetryBudgetSettingKey      = "resin_retry_budget_seconds"
+	resinBreakerThresholdSettingKey = "resin_breaker_threshold"
+	resinBreakerCooldownSettingKey  = "resin_breaker_cooldown_seconds"
+	resinRetryBudgetDefault         = 45
+	resinRetryBudgetMin             = 10
+	resinRetryBudgetMax             = 180
+	resinBreakerDefault             = 12
+	resinBreakerMin                 = 3
+	resinBreakerMax                 = 100
+	resinBreakerCooldownDefault     = 30
+	resinBreakerCooldownMin         = 5
+	resinBreakerCooldownMax         = 300
+	resinBreakerWindow              = 90 * time.Second
+	resinFailureWindow              = 30 * time.Second
+	resinFailureThreshold           = 3
+	resinMaxAttempts                = 10
+	resinControlPlaneAccountKey     = "relaydesk-control-plane"
 	// A Resin account is a sticky exit: once the upstream answers 429 for it,
 	// drawing the same account again spends a full attempt (seconds of upstream
 	// latency) on an exit that is already known to be limited. The floor keeps
@@ -70,6 +87,12 @@ type proxyEngineStatus struct {
 	ResinHealth         string     `json:"resin_health"`
 	// ResinCooledAccounts is how many exits are parked after a 429 right now.
 	ResinCooledAccounts int `json:"resin_cooled_accounts"`
+	// ResinBreakerOpen is the fast-fail state: enough consecutive 429s proved the
+	// pool saturated, so requests are answered at once instead of feeding the storm.
+	ResinBreakerOpen            bool `json:"resin_breaker_open"`
+	ResinRetryBudgetSeconds     int  `json:"resin_retry_budget_seconds"`
+	ResinBreakerThreshold       int  `json:"resin_breaker_threshold"`
+	ResinBreakerCooldownSeconds int  `json:"resin_breaker_cooldown_seconds"`
 }
 
 func settingValue(db *sql.DB, key string) (string, error) {
@@ -90,6 +113,87 @@ func parseStoredTime(value string) *time.Time {
 		return nil
 	}
 	return &parsed
+}
+
+// settingInt reads a numeric operator setting, falling back to the default and
+// clamping to the documented range so a hand-edited row cannot disable a guard.
+func (a *App) settingInt(key string, fallback, min, max int) int {
+	raw, err := settingValue(a.db, key)
+	if err != nil {
+		return fallback
+	}
+	value, convErr := strconv.Atoi(strings.TrimSpace(raw))
+	if convErr != nil {
+		return fallback
+	}
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+// resinRetryBudget is how long one request may keep drawing fresh exits while
+// the pool answers 429 before the caller is told to come back later.
+func (a *App) resinRetryBudget() time.Duration {
+	return time.Duration(a.settingInt(resinRetryBudgetSettingKey, resinRetryBudgetDefault, resinRetryBudgetMin, resinRetryBudgetMax)) * time.Second
+}
+
+func (a *App) resinBreakerThreshold() int {
+	return a.settingInt(resinBreakerThresholdSettingKey, resinBreakerDefault, resinBreakerMin, resinBreakerMax)
+}
+
+func (a *App) resinBreakerCooldown() time.Duration {
+	return time.Duration(a.settingInt(resinBreakerCooldownSettingKey, resinBreakerCooldownDefault, resinBreakerCooldownMin, resinBreakerCooldownMax)) * time.Second
+}
+
+// resinBreakerOpenNow reports whether the pool is in the fast-fail state.
+func (a *App) resinBreakerOpenNow() bool {
+	return a.resinBreakerRemaining() > 0
+}
+
+// resinBreakerRemaining is how long the fast-fail state still has to run, so a
+// rejected caller can be told when trying again is worth it.
+func (a *App) resinBreakerRemaining() time.Duration {
+	a.resinBreakerMu.Lock()
+	defer a.resinBreakerMu.Unlock()
+	if remaining := time.Until(a.resinBreakerOpenUntil); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+// noteResinLimited counts one upstream 429. Enough of them inside the window
+// open the breaker: retrying a saturated pool only lengthens the limit, so the
+// gateway answers immediately and lets the client back off instead.
+func (a *App) noteResinLimited() {
+	threshold := a.resinBreakerThreshold()
+	cooldown := a.resinBreakerCooldown()
+	now := time.Now()
+	a.resinBreakerMu.Lock()
+	defer a.resinBreakerMu.Unlock()
+	if a.resinBreakerSince.IsZero() || now.Sub(a.resinBreakerSince) > resinBreakerWindow {
+		a.resinBreakerSince = now
+		a.resinBreakerHits = 0
+	}
+	a.resinBreakerHits++
+	if a.resinBreakerHits >= threshold {
+		a.resinBreakerOpenUntil = now.Add(cooldown)
+		a.resinBreakerHits = 0
+		a.resinBreakerSince = time.Time{}
+		log.Printf("resin breaker open for %s after %d consecutive 429s", cooldown, threshold)
+	}
+}
+
+// noteResinHealthy clears the streak; one success proves the pool is moving again.
+func (a *App) noteResinHealthy() {
+	a.resinBreakerMu.Lock()
+	a.resinBreakerHits = 0
+	a.resinBreakerSince = time.Time{}
+	a.resinBreakerOpenUntil = time.Time{}
+	a.resinBreakerMu.Unlock()
 }
 
 func (a *App) loadProxyEngine() (proxyEngineConfig, error) {
@@ -226,6 +330,11 @@ func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 		ResinLastCheckError: cfg.LastCheckError,
 		ResinHealth:         health,
 		ResinCooledAccounts: a.cooledResinAccounts(),
+
+		ResinBreakerOpen:            a.resinBreakerOpenNow(),
+		ResinRetryBudgetSeconds:     a.settingInt(resinRetryBudgetSettingKey, resinRetryBudgetDefault, resinRetryBudgetMin, resinRetryBudgetMax),
+		ResinBreakerThreshold:       a.resinBreakerThreshold(),
+		ResinBreakerCooldownSeconds: int(a.resinBreakerCooldown() / time.Second),
 	}, nil
 }
 
@@ -240,10 +349,13 @@ func (a *App) getProxyEngine(w http.ResponseWriter, _ *http.Request) {
 
 func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Engine          string  `json:"engine"`
-		ResinGatewayURL *string `json:"resin_gateway_url"`
-		ResinPlatform   *string `json:"resin_platform"`
-		ResinProxyToken *string `json:"resin_proxy_token"`
+		Engine                      string  `json:"engine"`
+		ResinGatewayURL             *string `json:"resin_gateway_url"`
+		ResinPlatform               *string `json:"resin_platform"`
+		ResinProxyToken             *string `json:"resin_proxy_token"`
+		ResinRetryBudgetSeconds     *int    `json:"resin_retry_budget_seconds"`
+		ResinBreakerThreshold       *int    `json:"resin_breaker_threshold"`
+		ResinBreakerCooldownSeconds *int    `json:"resin_breaker_cooldown_seconds"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid proxy engine configuration"})
@@ -300,6 +412,30 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 		{resinGatewayURLSettingKey, gatewayURL},
 		{resinPlatformSettingKey, platform},
 		{resinProxyTokenSettingKey, encryptedToken},
+	}
+	// The 429 policy is operator-tunable, but only inside the documented range:
+	// a budget of zero would relay every 429 and a breaker of one would trip on
+	// a single unlucky exit, so out-of-range input is refused rather than clamped.
+	knobs := []struct {
+		key   string
+		name  string
+		value *int
+		min   int
+		max   int
+	}{
+		{resinRetryBudgetSettingKey, "resin_retry_budget_seconds", in.ResinRetryBudgetSeconds, resinRetryBudgetMin, resinRetryBudgetMax},
+		{resinBreakerThresholdSettingKey, "resin_breaker_threshold", in.ResinBreakerThreshold, resinBreakerMin, resinBreakerMax},
+		{resinBreakerCooldownSettingKey, "resin_breaker_cooldown_seconds", in.ResinBreakerCooldownSeconds, resinBreakerCooldownMin, resinBreakerCooldownMax},
+	}
+	for _, knob := range knobs {
+		if knob.value == nil {
+			continue
+		}
+		if *knob.value < knob.min || *knob.value > knob.max {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("%s must be between %d and %d", knob.name, knob.min, knob.max)})
+			return
+		}
+		values = append(values, [2]string{knob.key, strconv.Itoa(*knob.value)})
 	}
 	if engine == proxyEngineBuiltin {
 		values = append(values,

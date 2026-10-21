@@ -80,7 +80,7 @@ func defaultCompressionConfig() compressionConfig {
 	return compressionConfig{
 		Enabled:            false,
 		APIStyle:           compressionStyleOpenAI,
-		UseProxy:           true,
+		UseProxy:           false,
 		TriggerRatio:       0.75,
 		ContextWindow:      200000,
 		KeepRecentMessages: 8,
@@ -285,6 +285,9 @@ func estimateTextTokens(text string) int {
 		}
 	}
 	tokens := ascii/4 + wide
+	if ascii%4 != 0 {
+		tokens++
+	}
 	if tokens < 1 {
 		tokens = 1
 	}
@@ -937,6 +940,7 @@ type compressionOutcome struct {
 	TokensAfter   int
 	SummaryTokens int
 	Model         string
+	SummaryModel  string
 	Err           error
 }
 
@@ -1020,6 +1024,7 @@ func (a *App) applyCompression(r *http.Request, sessionKey, model string, payloa
 		if summaryErr != nil {
 			outcome.Status = "failed"
 			outcome.Reason = "summarizer_failed"
+			outcome.SummaryModel = cfg.Model
 			outcome.Err = summaryErr
 			outcome.Blocking = !cfg.FailOpen
 			outcome.Messages = len(plan.Folding)
@@ -1056,6 +1061,7 @@ func (a *App) applyCompression(r *http.Request, sessionKey, model string, payloa
 
 	outcome.Status = "applied"
 	outcome.Applied = true
+	outcome.SummaryModel = cfg.Model
 	outcome.Messages = len(plan.Folding)
 	outcome.TokensBefore = plan.Before
 	outcome.TokensAfter = after
@@ -1121,7 +1127,7 @@ func setCompressionHeaders(w http.ResponseWriter, outcome compressionOutcome) {
 	w.Header().Set("X-Relay-Compression-Before", strconv.Itoa(outcome.TokensBefore))
 	w.Header().Set("X-Relay-Compression-After", strconv.Itoa(outcome.TokensAfter))
 	w.Header().Set("X-Relay-Compression-Saved-Tokens", strconv.Itoa(saved))
-	w.Header().Set("X-Relay-Compression-Model", outcome.Model)
+	w.Header().Set("X-Relay-Compression-Model", outcome.SummaryModel)
 }
 
 // ---------------------------------------------------------------------------

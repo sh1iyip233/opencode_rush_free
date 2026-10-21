@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App, { ClientKeysPanel, Models, Proxies, Usage } from "./main";
+import App, { ClientKeysPanel, CompressionPage, Models, Proxies, Usage } from "./main";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -489,5 +489,228 @@ describe("运维操作", () => {
       "/api/client-keys/2",
       expect.objectContaining({ method: "PATCH", body: JSON.stringify({ maintenance_allowed: true }) }),
     ));
+  });
+});
+
+const compressionSettings = {
+  enabled: true,
+  api_style: "openai",
+  base_url: "https://summary.example.com",
+  model: "summary-model",
+  use_proxy: false,
+  trigger_ratio: 0.75,
+  context_window: 200000,
+  keep_recent_messages: 8,
+  min_fold_messages: 4,
+  max_summary_tokens: 1200,
+  temperature: 0.2,
+  timeout_seconds: 90,
+  summary_role: "system",
+  marker: "📦 已折叠 {count} 条较早消息",
+  prompt: "把较早的对话压缩成一份摘要。",
+  fail_open: true,
+  has_api_key: true,
+  configured: true,
+  default_marker: "📦 [Relay Desk 压缩摘要] 已折叠 {count} 条较早消息",
+  default_prompt: "默认压缩提示词",
+};
+
+const compressionStats = {
+  days: 7,
+  compressions: 3,
+  failures: 1,
+  tokens_before: 9000,
+  tokens_after: 3000,
+  saved_tokens: 6000,
+  summary_tokens: 1200,
+  average_latency_ms: 640,
+  sessions: 1,
+  daily: [{ date: "2026-10-20", compressions: 3, saved_tokens: 6000, failures: 1 }],
+  recent: [
+    {
+      id: 12,
+      created_at: "2026-10-20T08:00:00Z",
+      session_key: "session-alpha",
+      model: "alpha:free",
+      api_style: "openai",
+      summary_model: "summary-model",
+      folded_messages: 6,
+      tokens_before: 9000,
+      tokens_after: 3000,
+      saved_tokens: 6000,
+      summary_tokens: 1200,
+      latency_ms: 640,
+      status: "success",
+      error_message: "",
+    },
+  ],
+};
+
+const compressionSessions = {
+  sessions: [
+    {
+      session_key: "session-alpha",
+      model: "alpha:free",
+      preview: "摘要预览文本",
+      folded_messages: 6,
+      folded_tokens: 9000,
+      compressions: 1,
+      tokens_before: 9000,
+      tokens_after: 3000,
+      created_at: "2026-10-20T08:00:00Z",
+      updated_at: "2026-10-20T08:00:00Z",
+    },
+  ],
+};
+
+const compressionResponse = (input: RequestInfo | URL, init?: RequestInit) => {
+  const path = String(input);
+  if (path === "/api/settings/compression" && (!init?.method || init.method === "GET")) {
+    return json(compressionSettings);
+  }
+  if (path === "/api/settings/compression" && init?.method === "PUT") {
+    return json({ ...compressionSettings, ...JSON.parse(String(init.body)) });
+  }
+  if (path === "/api/settings/compression/test") {
+    return json({
+      ok: true,
+      summary: "接口返回的摘要",
+      summary_tokens: 12,
+      prompt_tokens: 40,
+      completion_tokens: 12,
+      latency_ms: 88,
+      api_style: "openai",
+      model: "summary-model",
+      endpoint: "https://summary.example.com/v1/chat/completions",
+    });
+  }
+  if (path.startsWith("/api/compression/stats")) return json(compressionStats);
+  if (path.startsWith("/api/compression/sessions?")) return json(compressionSessions);
+  if (path === "/api/compression/preview") {
+    return json({
+      applied: true,
+      window: 200000,
+      folded_messages: 3,
+      kept_messages: 2,
+      tokens_before: 1000,
+      tokens_after: 400,
+      saved_tokens: 600,
+      summary: "预览生成的摘要",
+      summary_tokens: 50,
+      latency_ms: 42,
+    });
+  }
+  if (path.startsWith("/api/compression/sessions/")) return json({ ok: true, removed: 1 });
+  return json({});
+};
+
+describe("压缩网关", () => {
+  it("加载配置、统计与会话摘要", async () => {
+    vi.stubGlobal("fetch", vi.fn(compressionResponse));
+    render(
+      <CompressionPage
+        notify={vi.fn()}
+        onLogout={vi.fn()}
+        registerRefresh={() => () => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { level: 3, name: "摘要接口与折叠策略" })).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("https://summary.example.com")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("summary-model")).toBeInTheDocument();
+    expect((await screen.findAllByText("session-alpha")).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/近 7 天折叠次数/)).toBeInTheDocument();
+    expect(screen.getByText("6,000")).toBeInTheDocument();
+  });
+
+  it("保存配置时提交可配置字段且不回传密钥", async () => {
+    vi.stubGlobal("fetch", vi.fn(compressionResponse));
+    render(
+      <CompressionPage notify={vi.fn()} onLogout={vi.fn()} registerRefresh={() => () => {}} />,
+    );
+
+    await screen.findByDisplayValue("https://summary.example.com");
+    fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
+
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        "/api/settings/compression",
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+    const call = vi
+      .mocked(fetch)
+      .mock.calls.find(([input, init]) => String(input) === "/api/settings/compression" && init?.method === "PUT");
+    const body = JSON.parse(String(call?.[1]?.body));
+    expect(body).toMatchObject({
+      enabled: true,
+      api_style: "openai",
+      base_url: "https://summary.example.com",
+      model: "summary-model",
+      trigger_ratio: 0.75,
+      context_window: 200000,
+      keep_recent_messages: 8,
+      min_fold_messages: 4,
+      max_summary_tokens: 1200,
+      summary_role: "system",
+      fail_open: true,
+    });
+    expect(body.api_key).toBeUndefined();
+    expect(body.has_api_key).toBeUndefined();
+  });
+
+  it("预览压缩会提交示例消息并展示折叠结果", async () => {
+    vi.stubGlobal("fetch", vi.fn(compressionResponse));
+    render(
+      <CompressionPage notify={vi.fn()} onLogout={vi.fn()} registerRefresh={() => () => {}} />,
+    );
+
+    await screen.findByRole("heading", { level: 3, name: "摘要接口与折叠策略" });
+    fireEvent.click(screen.getByRole("button", { name: "预览压缩" }));
+
+    expect(await screen.findByText(/已折叠 3 条 · 保留 2 条/)).toBeInTheDocument();
+    const call = vi
+      .mocked(fetch)
+      .mock.calls.find(([input]) => String(input) === "/api/compression/preview");
+    const body = JSON.parse(String(call?.[1]?.body));
+    expect(Array.isArray(body.messages)).toBe(true);
+    expect(body.messages.length).toBeGreaterThan(0);
+    expect(body.force).toBe(true);
+  });
+
+  it("测试摘要接口后展示返回的摘要", async () => {
+    vi.stubGlobal("fetch", vi.fn(compressionResponse));
+    render(
+      <CompressionPage notify={vi.fn()} onLogout={vi.fn()} registerRefresh={() => () => {}} />,
+    );
+
+    await screen.findByDisplayValue("summary-model");
+    fireEvent.click(screen.getByRole("button", { name: "测试摘要接口" }));
+
+    expect(await screen.findByText(/接口返回的摘要/)).toBeInTheDocument();
+    expect(await screen.findByText(/88 ms/)).toBeInTheDocument();
+  });
+
+  it("从导航进入压缩网关页", async () => {
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const compression = compressionResponse(input, init);
+      const path = String(input);
+      if (path.startsWith("/api/compression") || path.startsWith("/api/settings/compression")) {
+        return Promise.resolve(compression);
+      }
+      return Promise.resolve(adminResponse(input, init));
+    });
+    render(<App />);
+    await screen.findByRole("heading", { name: "仪表盘" });
+
+    fireEvent.click(screen.getByRole("button", { name: /压缩网关Compression/ }));
+
+    expect(await screen.findByRole("heading", { level: 1, name: "压缩网关" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        "/api/settings/compression",
+        expect.anything(),
+      ),
+    );
   });
 });

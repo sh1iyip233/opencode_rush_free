@@ -1018,6 +1018,10 @@ textarea {
   font-size: 19px;
 }
 
+.gateway-key-link {
+  margin-top: 4px;
+}
+
 .gateway-meta {
   justify-content: space-between;
   gap: 12px;
@@ -1266,6 +1270,7 @@ textarea {
   min-width: 0;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   min-height: 44px;
   padding: 8px 0;
@@ -1273,11 +1278,42 @@ textarea {
   font-size: 10px;
 }
 
+.key-entry + .key-entry {
+  border-top: 1px solid var(--line);
+}
+
+.key-entry .key-row {
+  border-top: 0;
+}
+
+.key-secret {
+  margin: 0 0 10px;
+}
+
+.key-recovery-state {
+  white-space: nowrap;
+}
+
+.key-recovery-state.recoverable {
+  color: var(--success);
+  background: var(--success-bg);
+}
+
+.key-recovery-state.unrecoverable {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
 .key-row > div:first-child {
   min-width: 0;
+  flex-basis: 180px;
   display: grid;
   flex: 1;
   gap: 3px;
+}
+
+.client-keys-panel .row-actions {
+  margin-left: auto;
 }
 
 .key-row b,
@@ -2523,6 +2559,15 @@ textarea {
 
   .key-row .row-actions {
     margin-left: auto;
+  }
+
+  .client-keys-panel .key-row > div:first-child {
+    flex-basis: 100%;
+  }
+
+  .client-keys-panel .key-recovery-state,
+  .client-keys-panel .maintenance-key-toggle {
+    margin-top: 2px;
   }
 
   .import-report span {

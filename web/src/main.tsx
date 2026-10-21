@@ -11,6 +11,8 @@ import {
   CircleGauge,
   Copy,
   Database,
+  Eye,
+  EyeOff,
   Filter,
   FilterX,
   ImageIcon,
@@ -129,6 +131,7 @@ type ClientKey = {
   id: number;
   name: string;
   hint: string;
+  recoverable: boolean;
   enabled: boolean;
   maintenance_allowed: boolean;
   expires_at?: string;
@@ -1776,11 +1779,17 @@ function ClientKeysPanel({
   const [rpm, setRPM] = useState("0");
   const [tpm, setTPM] = useState("0");
   const [expiresAt, setExpiresAt] = useState("");
-  const [created, setCreated] = useState("");
+  const [visibleKeys, setVisibleKeys] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
   const load = useCallback(async () => {
     try {
-      setKeys((await api("/api/client-keys")) as ClientKey[]);
+      const next = (await api("/api/client-keys")) as ClientKey[];
+      setKeys(next);
+      setVisibleKeys((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([id]) => next.some((key) => key.id === Number(id))),
+        ),
+      );
       return true;
     } catch (error) {
       notify((error as Error).message, "error");
@@ -1799,10 +1808,10 @@ function ClientKeysPanel({
     setBusy(true);
     try {
       const data = await api("/api/client-keys", { method: "POST", body: JSON.stringify({ name, expires_at: expiresAt ? new Date(expiresAt).toISOString() : "", rpm_limit: rpmLimit, tpm_limit: tpmLimit }) });
-      setCreated(data.client_key);
       setName("");
 		setExpiresAt("");
       await load();
+		setVisibleKeys((current) => ({ ...current, [data.id]: data.client_key }));
       notify("客户端 Key 已创建");
     } catch (error) {
       notify((error as Error).message, "error");
@@ -1821,12 +1830,45 @@ function ClientKeysPanel({
   };
   const rotate = async (key: ClientKey) => {
     if (!confirm(`轮换 ${key.name} 后旧 Key 会失效，继续？`)) return;
+	setBusy(true);
     try {
       const data = await api(`/api/client-keys/${key.id}/rotate`, { method: "POST" });
-      setCreated(data.client_key);
+		setVisibleKeys((current) => ({ ...current, [key.id]: data.client_key }));
       notify("新 Key 已生成，请立即复制");
       await load();
-    } catch (error) { notify((error as Error).message, "error"); }
+	} catch (error) { notify((error as Error).message, "error"); } finally { setBusy(false); }
+  };
+  const reveal = async (key: ClientKey) => {
+	if (visibleKeys[key.id]) {
+		setVisibleKeys((current) => {
+			const next = { ...current };
+			delete next[key.id];
+			return next;
+		});
+		return;
+	}
+	setBusy(true);
+	try {
+		const data = await api(`/api/client-keys/${key.id}/secret`);
+		setVisibleKeys((current) => ({ ...current, [key.id]: data.client_key }));
+	} catch (error) {
+		notify((error as Error).message, "error");
+	} finally {
+		setBusy(false);
+	}
+  };
+  const copySecret = async (key: ClientKey) => {
+	setBusy(true);
+	try {
+		const secret = visibleKeys[key.id] || (await api(`/api/client-keys/${key.id}/secret`)).client_key;
+		if (!navigator.clipboard) throw new Error("剪贴板不可用");
+		await navigator.clipboard.writeText(secret);
+		notify("客户端 Key 已复制");
+	} catch (error) {
+		notify((error as Error).message, "error");
+	} finally {
+		setBusy(false);
+	}
   };
   const remove = async (key: ClientKey) => {
     if (!confirm(`删除 ${key.name} 后无法再使用该 Key，继续？`)) return;
@@ -1841,8 +1883,8 @@ function ClientKeysPanel({
       setBusy(false);
     }
   };
-  return <section className="panel client-keys-panel">
-    <div className="panel-head"><div><span className="eyebrow">CLIENT ACCESS</span><h3>客户端 Key</h3><p className="muted">每个客户端可独立撤销、限流和审计。</p></div><UsersRound size={20} /></div>
+  return <section className="panel client-keys-panel" id="client-keys">
+    <div className="panel-head"><div><span className="eyebrow">CLIENT ACCESS</span><h3>客户端 Key</h3><p className="muted">每个客户端可独立撤销、限流和审计。Key 以加密方式保存，仅管理员可按需查看。</p></div><UsersRound size={20} /></div>
     <div className="key-create-grid">
       <label>名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 CI" /></label>
       <label>RPM<input type="number" min="0" value={rpm} onChange={(event) => setRPM(event.target.value)} /></label>
@@ -1850,13 +1892,16 @@ function ClientKeysPanel({
 		<label>到期时间<input type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} /></label>
       <button className="secondary" onClick={create} disabled={busy}>创建 Key</button>
     </div>
-    {created && <div className="copy-field"><code>{created}</code><button className="icon-btn" title="复制 Key" onClick={async () => { try { await navigator.clipboard.writeText(created); notify("客户端 Key 已复制"); } catch { notify("复制失败", "error"); } }}><Copy size={15} /></button></div>}
     <div className="key-list">
-      {keys.map((key) => <div className="key-row" key={key.id}>
-        <div><b>{key.name}</b><small>{key.hint} · {key.rpm_limit || "∞"} RPM · {key.tpm_limit || "∞"} TPM{key.expires_at ? ` · 到期 ${new Date(key.expires_at).toLocaleString()}` : ""}{key.last_used_at ? ` · 最近使用 ${new Date(key.last_used_at).toLocaleString()}` : ""}</small></div>
-        <span className={`health ${key.enabled ? "healthy" : "disabled"}`}><i />{key.enabled ? "启用" : "已停用"}</span>
-        <label className="maintenance-key-toggle" title="Only allow this key through the gateway during maintenance"><input type="checkbox" checked={key.maintenance_allowed} onChange={(event) => void update(key, { maintenance_allowed: event.target.checked })} disabled={busy || !key.enabled} /><span>维护放行</span></label>
-        <div className="row-actions"><button className="icon-btn" title={key.enabled ? "停用 Key" : "启用 Key"} onClick={() => void update(key, { enabled: !key.enabled })} disabled={busy}><KeyRound size={15} /></button><button className="icon-btn" title="轮换 Key" onClick={() => void rotate(key)} disabled={busy}><RefreshCw size={15} /></button>{keys.length > 1 && <button className="icon-btn" title="删除 Key" onClick={() => void remove(key)} disabled={busy}><Trash2 size={15} /></button>}</div>
+      {keys.map((key) => <div className="key-entry" key={key.id}>
+        <div className="key-row">
+          <div><b>{key.name}</b><small>{key.hint} · {key.rpm_limit || "∞"} RPM · {key.tpm_limit || "∞"} TPM{key.expires_at ? ` · 到期 ${new Date(key.expires_at).toLocaleString()}` : ""}{key.last_used_at ? ` · 最近使用 ${new Date(key.last_used_at).toLocaleString()}` : ""}</small></div>
+          <span className={`health ${key.enabled ? "healthy" : "disabled"}`}><i />{key.enabled ? "启用" : "已停用"}</span>
+          <span className={`reason key-recovery-state ${key.recoverable ? "recoverable" : "unrecoverable"}`}>{key.recoverable ? "可查看" : "旧 Key 无法查看"}</span>
+          <label className="maintenance-key-toggle" title="Only allow this key through the gateway during maintenance"><input type="checkbox" checked={key.maintenance_allowed} onChange={(event) => void update(key, { maintenance_allowed: event.target.checked })} disabled={busy || !key.enabled} /><span>维护放行</span></label>
+          <div className="row-actions"><button className="icon-btn" title={key.enabled ? "停用 Key" : "启用 Key"} onClick={() => void update(key, { enabled: !key.enabled })} disabled={busy}><KeyRound size={15} /></button><button className="icon-btn" title={key.recoverable ? (visibleKeys[key.id] ? "隐藏 Key" : "显示 Key") : "旧 Key 无法查看，请轮换"} onClick={() => void reveal(key)} disabled={busy || !key.recoverable}>{visibleKeys[key.id] ? <EyeOff size={15} /> : <Eye size={15} />}</button><button className="icon-btn" title={key.recoverable ? "复制 Key" : "旧 Key 无法复制，请轮换"} onClick={() => void copySecret(key)} disabled={busy || !key.recoverable}><Copy size={15} /></button><button className="icon-btn" title="轮换 Key" onClick={() => void rotate(key)} disabled={busy}><RefreshCw size={15} /></button>{keys.length > 1 && <button className="icon-btn" title="删除 Key" onClick={() => void remove(key)} disabled={busy}><Trash2 size={15} /></button>}</div>
+        </div>
+        {visibleKeys[key.id] && <div className="copy-field key-secret"><code>{visibleKeys[key.id]}</code><button className="icon-btn" title="复制 Key" onClick={() => void copySecret(key)} disabled={busy}><Copy size={15} /></button><button className="icon-btn" title="隐藏 Key" onClick={() => void reveal(key)} disabled={busy}><EyeOff size={15} /></button></div>}
       </div>)}
     </div>
   </section>;
@@ -2019,7 +2064,6 @@ function Models({
   const [headers, setHeaders] = useState(() =>
     headersToText(upstream.custom_headers),
   );
-  const [clientKey, setClientKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
   const childRefreshers = useRef(new Set<RefreshHandler>());
@@ -2092,18 +2136,6 @@ function Models({
       setBusy(false);
     }
   };
-  const rotate = async () => {
-    if (!confirm("轮换后旧客户端 Key 会立即失效，继续？")) return;
-    try {
-      const d = await api("/api/settings/client-key/rotate", {
-        method: "POST",
-      });
-      setClientKey(d.client_key);
-      notify("新 Key 已生成，请立即复制");
-    } catch (e) {
-      notify((e as Error).message, "error");
-    }
-  };
   const testKey = async () => {
     setBusy(true);
     setTestResult(null);
@@ -2122,15 +2154,6 @@ function Models({
       if (!navigator.clipboard) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(`${location.origin}/v1`);
       notify("网关地址已复制");
-    } catch {
-      notify("复制失败", "error");
-    }
-  };
-  const copyKey = async () => {
-    try {
-      if (!navigator.clipboard) throw new Error("clipboard unavailable");
-      await navigator.clipboard.writeText(clientKey);
-      notify("客户端 Key 已复制");
     } catch {
       notify("复制失败", "error");
     }
@@ -2241,27 +2264,13 @@ function Models({
               <Copy size={15} />
             </button>
           </div>
-          <div className="gateway-meta">
-            <span>
-              <KeyRound size={14} />
-              客户端 Key
-            </span>
-            <button className="text-btn" onClick={rotate}>
-              轮换 Key
-            </button>
-          </div>
-          {clientKey && (
-            <div className="copy-field">
-              <code>{clientKey}</code>
-              <button className="icon-btn" title="复制 Key" onClick={copyKey}>
-                <Copy size={15} />
-              </button>
-            </div>
-          )}
           <p className="muted small">
-            这是给 OpenCode 客户端使用的网关 Key，以 ocp- 开头；不要把它填入上游
-            API Key。Key 只在生成后展示一次。
+            将此地址和下方创建的 Client Key 填入 OpenCode。上游 OpenCode / Zen API Key 仅用于服务器向上游认证，不是客户端 Key。
           </p>
+          <button className="text-btn gateway-key-link" type="button" onClick={() => document.getElementById("client-keys")?.scrollIntoView({ behavior: "smooth", block: "start" })}>
+            管理客户端 Key
+            <ArrowUpRight size={14} />
+          </button>
         </div>
       </section>
       <section className="panel vision-helper-panel">

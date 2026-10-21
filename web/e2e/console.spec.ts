@@ -18,10 +18,16 @@ async function login(page: Page) {
 async function expectPageFrame(page: Page, title: string) {
   await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
   await expect(page.locator("h1")).toHaveCount(1);
-  await expect.poll(() => page.evaluate(() => ({
-    body: document.body.scrollWidth - document.body.clientWidth,
-    document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-  }))).toEqual({ body: 0, document: 0 });
+  await expect.poll(() => page.evaluate(() => {
+    const viewport = document.documentElement.clientWidth;
+    return Array.from(document.querySelectorAll<HTMLElement>("body *"))
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        return { tag: node.tagName, className: node.className, right: Math.round(rect.right), width: Math.round(rect.width) };
+      })
+      .filter((node) => node.right > viewport + 1)
+      .slice(0, 12);
+  })).toEqual([]);
 }
 
 async function capture(page: Page, testInfo: TestInfo, name: string) {
@@ -120,6 +126,40 @@ test("390x844 抽屉和五个页面适配移动端", async ({ page }, testInfo) 
     }
     await capture(page, testInfo, `mobile-${entry.view}`);
   }
+});
+
+test("Client Key 行在桌面和移动端可显示且无溢出", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  await openConsolePage(page, "模型与网关", false);
+
+  const name = `Layout Key ${Date.now()}`;
+  await page.getByPlaceholder("例如 CI").fill(name);
+  await page.getByRole("button", { name: "创建 Key" }).click();
+  const entry = page.locator(".key-entry", { hasText: name });
+  await expect(entry).toBeVisible();
+  await expect(entry.locator(".key-secret code")).toHaveText(/ocp-/);
+  await expect.poll(() => page.evaluate(() => ({
+    body: document.body.scrollWidth - document.body.clientWidth,
+    document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  }))).toEqual({ body: 0, document: 0 });
+  await capture(page, testInfo, "desktop-client-key");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await entry.scrollIntoViewIfNeeded();
+  await expect(entry).toBeVisible();
+  await expect(entry.locator(".key-secret code")).toHaveText(/ocp-/);
+  await expect.poll(() => page.evaluate(() => {
+    const viewport = document.documentElement.clientWidth;
+    return Array.from(document.querySelectorAll<HTMLElement>("body *"))
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        return { tag: node.tagName, className: node.className, right: Math.round(rect.right), width: Math.round(rect.width) };
+      })
+      .filter((node) => node.right > viewport + 1)
+      .slice(0, 12);
+  })).toEqual([]);
+  await capture(page, testInfo, "mobile-client-key");
 });
 
 test("公开状态页在桌面和移动端均无溢出", async ({ page }, testInfo) => {

@@ -1274,13 +1274,46 @@ func TestAdminImportRefreshAndGatewayModels(t *testing.T) {
 	if len(freeModels) != 1 || freeModels[0].ModelID != "alpha:free" {
 		t.Fatalf("free filter failed: %#v", freeModels)
 	}
-	rotate := request(http.MethodPost, "/api/settings/client-key/rotate", "{}")
+	legacyRotate := request(http.MethodPost, "/api/settings/client-key/rotate", "{}")
+	if legacyRotate.StatusCode != http.StatusGone {
+		t.Fatalf("expected retired legacy rotation endpoint to return 410, got %d", legacyRotate.StatusCode)
+	}
+	createKey := request(http.MethodPost, "/api/client-keys", `{"name":"OpenCode","rpm_limit":0,"tpm_limit":0}`)
+	if createKey.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(createKey.Body)
+		t.Fatalf("client key creation failed: %d %s", createKey.StatusCode, body)
+	}
 	var key struct {
+		ID        int64  `json:"id"`
 		ClientKey string `json:"client_key"`
 	}
-	_ = json.NewDecoder(rotate.Body).Decode(&key)
+	_ = json.NewDecoder(createKey.Body).Decode(&key)
 	if !strings.HasPrefix(key.ClientKey, "ocp-") || strings.Contains(key.ClientKey, "_") {
 		t.Fatalf("invalid client key: %q", key.ClientKey)
+	}
+	secret := request(http.MethodGet, fmt.Sprintf("/api/client-keys/%d/secret", key.ID), "{}")
+	if secret.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(secret.Body)
+		t.Fatalf("client key secret lookup failed: %d %s", secret.StatusCode, body)
+	}
+	var secretPayload struct {
+		ClientKey string `json:"client_key"`
+	}
+	_ = json.NewDecoder(secret.Body).Decode(&secretPayload)
+	if secretPayload.ClientKey != key.ClientKey {
+		t.Fatalf("client key secret lookup returned %q, want %q", secretPayload.ClientKey, key.ClientKey)
+	}
+	listedKeys := request(http.MethodGet, "/api/client-keys", "")
+	var listedKeysPayload []struct {
+		ID          int64  `json:"id"`
+		Recoverable bool   `json:"recoverable"`
+		ClientKey   string `json:"client_key"`
+	}
+	_ = json.NewDecoder(listedKeys.Body).Decode(&listedKeysPayload)
+	for _, listedKey := range listedKeysPayload {
+		if listedKey.ID == key.ID && (!listedKey.Recoverable || listedKey.ClientKey != "") {
+			t.Fatalf("client key list leaked or misreported secret: %#v", listedKey)
+		}
 	}
 	req, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+key.ClientKey)
@@ -1429,21 +1462,21 @@ func TestSessionProxyAffinityAndQuotaAdvance(t *testing.T) {
 	proxies := []ProxyRecord{{ID: 101, URI: "http://127.0.0.1:3128"}, {ID: 202, URI: "http://127.0.0.2:3128"}}
 	session := "session-hash"
 
-	first, ok, err := a.pickSessionProxy(session, proxies, nil)
+	first, ok, err := a.pickSessionProxy(proxyPick{proxies: proxies, sessionKey: session})
 	if err != nil || !ok {
 		t.Fatal("expected a proxy")
 	}
-	same, ok, err := a.pickSessionProxy(session, proxies, nil)
+	same, ok, err := a.pickSessionProxy(proxyPick{proxies: proxies, sessionKey: session})
 	if err != nil || !ok || same.ID != first.ID {
 		t.Fatalf("session did not stay on its proxy: first=%d got=%d", first.ID, same.ID)
 	}
-	next, ok, err := a.pickSessionProxy(session, proxies, nil)
+	next, ok, err := a.pickSessionProxy(proxyPick{proxies: proxies, sessionKey: session})
 	if err != nil || !ok || next.ID == first.ID {
 		t.Fatalf("quota did not advance the session: first=%d got=%d", first.ID, next.ID)
 	}
 
 	a.clearSessionProxy(session, next.ID)
-	again, ok, err := a.pickSessionProxy(session, proxies, map[int64]struct{}{first.ID: {}})
+	again, ok, err := a.pickSessionProxy(proxyPick{proxies: proxies, sessionKey: session, used: map[int64]struct{}{first.ID: {}}})
 	if err != nil || !ok || again.ID != next.ID {
 		t.Fatalf("cleared binding did not select the next eligible proxy: want=%d got=%d", next.ID, again.ID)
 	}
@@ -1453,18 +1486,66 @@ func TestSessionKeyUsesHeaderThenUser(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	r.Header.Set("Authorization", "Bearer client-one")
 	r.Header.Set("X-Relay-Session-ID", "conversation-one")
-	fromHeader := sessionKey(r, json.RawMessage(`"ignored-user"`))
-	if fromHeader != sessionKey(r, json.RawMessage(`"different-user"`)) {
+	fromHeader := sessionKey(r, json.RawMessage(`"ignored-user"`), nil)
+	if fromHeader != sessionKey(r, json.RawMessage(`"different-user"`), nil) {
 		t.Fatal("session header should take precedence")
 	}
 	r.Header.Del("X-Relay-Session-ID")
-	fromUser := sessionKey(r, json.RawMessage(`"conversation-one"`))
+	fromUser := sessionKey(r, json.RawMessage(`"conversation-one"`), nil)
 	if fromHeader != fromUser {
 		t.Fatal("equivalent header and user session identifiers should match")
 	}
 	r.Header.Set("Authorization", "Bearer client-two")
-	if fromUser == sessionKey(r, json.RawMessage(`"conversation-one"`)) {
+	if fromUser == sessionKey(r, json.RawMessage(`"conversation-one"`), nil) {
 		t.Fatal("sessions from different client keys must not share a route")
+	}
+}
+
+func TestSessionKeyFallsBackToFirstUserMessage(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("Authorization", "Bearer client-one")
+	opening := []any{
+		map[string]any{"role": "system", "content": "be brief"},
+		map[string]any{"role": "user", "content": "how do I rotate an exit"},
+	}
+	// A one-shot prompt has no conversation to stay sticky to.
+	if got := sessionKey(r, nil, opening); got != "" {
+		t.Fatalf("a single prompt produced affinity %q", got)
+	}
+	turn := append(append([]any{}, opening...), map[string]any{"role": "assistant", "content": "like this"}, map[string]any{"role": "user", "content": "and then"})
+	first := sessionKey(r, nil, turn)
+	if first == "" {
+		t.Fatal("a conversation without identifiers got no affinity")
+	}
+	// The next turn repeats the opening message and appends to it.
+	later := sessionKey(r, nil, append(append([]any{}, turn...), map[string]any{"role": "assistant", "content": "ok"}, map[string]any{"role": "user", "content": "more"}))
+	if first != later {
+		t.Fatal("the affinity changed between turns of one conversation")
+	}
+	other := sessionKey(r, nil, []any{
+		map[string]any{"role": "user", "content": "a different question"},
+		map[string]any{"role": "assistant", "content": "an answer"},
+		map[string]any{"role": "user", "content": "a follow up"},
+	})
+	if first == other {
+		t.Fatal("two conversations shared one affinity")
+	}
+	// The header still wins over the message fingerprint.
+	r.Header.Set("X-Session-ID", "explicit")
+	if sessionKey(r, nil, turn) == first {
+		t.Fatal("the session header should take precedence over the message")
+	}
+	// Image-only openings carry no words to key on.
+	bare := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	bare.Header.Set("Authorization", "Bearer client-one")
+	picture := []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AAAA"}}}
+	imageOnly := []any{
+		map[string]any{"role": "user", "content": picture},
+		map[string]any{"role": "assistant", "content": "a picture"},
+		map[string]any{"role": "user", "content": picture},
+	}
+	if got := sessionKey(bare, nil, imageOnly); got != "" {
+		t.Fatalf("an image-only opening produced affinity %q", got)
 	}
 }
 
@@ -1751,11 +1832,11 @@ func TestPatchMissingProxyReturnsNotFound(t *testing.T) {
 func TestRequestsWithoutSessionIDRoundRobin(t *testing.T) {
 	a := testApp(t)
 	proxies := []ProxyRecord{{ID: 1}, {ID: 2}}
-	first, ok, err := a.pickSessionProxy("", proxies, nil)
+	first, ok, err := a.pickSessionProxy(proxyPick{proxies: proxies})
 	if err != nil || !ok {
 		t.Fatalf("first selection failed: %v", err)
 	}
-	second, ok, err := a.pickSessionProxy("", proxies, nil)
+	second, ok, err := a.pickSessionProxy(proxyPick{proxies: proxies})
 	if err != nil || !ok {
 		t.Fatalf("second selection failed: %v", err)
 	}
@@ -1782,14 +1863,28 @@ func TestEncryptionKeyRotationIsRepeatable(t *testing.T) {
 	if _, err = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('upstream_api_key',?)", apiKey); err != nil {
 		t.Fatal(err)
 	}
+	clientKeyPlain := "recoverable-client-key"
+	clientKeyEncrypted, err := a.encrypt(clientKeyPlain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := a.db.Exec("INSERT INTO client_keys(name,key_hash,key_hint,encrypted_key,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", "Recoverable", hashToken(clientKeyPlain), clientKeyHint(clientKeyPlain), clientKeyEncrypted, 1, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKeyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
 	newHash := sha256.Sum256([]byte("replacement-encryption-key-that-is-long-enough"))
 	a.key = newHash[:]
 	migrated, err := a.rotateEncryptionKey(previousKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migrated != 2 {
-		t.Fatalf("expected two encrypted values to migrate, got %d", migrated)
+	if migrated != 4 {
+		t.Fatalf("expected four encrypted values to migrate, got %d", migrated)
 	}
 	var encryptedPassword string
 	if err = a.db.QueryRow("SELECT encrypted_password FROM proxies WHERE id=?", id).Scan(&encryptedPassword); err != nil {
@@ -1805,9 +1900,78 @@ func TestEncryptionKeyRotationIsRepeatable(t *testing.T) {
 	if value, err := a.decrypt(encryptedAPIKey); err != nil || value != "upstream-secret" {
 		t.Fatalf("rotated API key is invalid: value=%q err=%v", value, err)
 	}
+	var encryptedClientKey string
+	if err = a.db.QueryRow("SELECT encrypted_key FROM client_keys WHERE id=?", clientKeyID).Scan(&encryptedClientKey); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := a.decrypt(encryptedClientKey); err != nil || value != clientKeyPlain {
+		t.Fatalf("rotated client key is invalid: value=%q err=%v", value, err)
+	}
 	migrated, err = a.rotateEncryptionKey(previousKey)
 	if err != nil || migrated != 0 {
 		t.Fatalf("repeat rotation should be a no-op: migrated=%d err=%v", migrated, err)
+	}
+}
+
+func TestClientKeySecretSupportsRecoveryAndDeletion(t *testing.T) {
+	a := testApp(t)
+	create := httptest.NewRecorder()
+	a.createClientKey(create, httptest.NewRequest(http.MethodPost, "/api/client-keys", strings.NewReader(`{"name":"Recoverable","rpm_limit":0,"tpm_limit":0}`)))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create client key failed: %d %s", create.Code, create.Body.String())
+	}
+	var created struct {
+		ID        int64  `json:"id"`
+		ClientKey string `json:"client_key"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+
+	secret := httptest.NewRecorder()
+	secretRequest := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/client-keys/%d/secret", created.ID), nil)
+	secretRequest.SetPathValue("id", strconv.FormatInt(created.ID, 10))
+	a.getClientKeySecret(secret, secretRequest)
+	if secret.Code != http.StatusOK || !strings.Contains(secret.Body.String(), created.ClientKey) {
+		t.Fatalf("recoverable client key was not returned: %d %s", secret.Code, secret.Body.String())
+	}
+
+	if _, err := a.db.Exec("UPDATE client_keys SET enabled=0 WHERE id=?", created.ID); err != nil {
+		t.Fatal(err)
+	}
+	disabledSecret := httptest.NewRecorder()
+	disabledRequest := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/client-keys/%d/secret", created.ID), nil)
+	disabledRequest.SetPathValue("id", strconv.FormatInt(created.ID, 10))
+	a.getClientKeySecret(disabledSecret, disabledRequest)
+	if disabledSecret.Code != http.StatusOK || !strings.Contains(disabledSecret.Body.String(), created.ClientKey) {
+		t.Fatalf("disabled client key should remain recoverable to an admin: %d %s", disabledSecret.Code, disabledSecret.Body.String())
+	}
+
+	if _, err := a.db.Exec("DELETE FROM client_keys WHERE id=?", created.ID); err != nil {
+		t.Fatal(err)
+	}
+	deletedSecret := httptest.NewRecorder()
+	deletedRequest := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/client-keys/%d/secret", created.ID), nil)
+	deletedRequest.SetPathValue("id", strconv.FormatInt(created.ID, 10))
+	a.getClientKeySecret(deletedSecret, deletedRequest)
+	if deletedSecret.Code != http.StatusNotFound {
+		t.Fatalf("deleted client key secret should return 404, got %d: %s", deletedSecret.Code, deletedSecret.Body.String())
+	}
+
+	legacyNow := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.Exec("INSERT INTO client_keys(name,key_hash,key_hint,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)", "Legacy", hashToken("legacy-client-key"), "legacy", 1, legacyNow, legacyNow); err != nil {
+		t.Fatal(err)
+	}
+	var legacyID int64
+	if err := a.db.QueryRow("SELECT id FROM client_keys WHERE key_hash=?", hashToken("legacy-client-key")).Scan(&legacyID); err != nil {
+		t.Fatal(err)
+	}
+	legacySecret := httptest.NewRecorder()
+	legacyRequest := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/client-keys/%d/secret", legacyID), nil)
+	legacyRequest.SetPathValue("id", strconv.FormatInt(legacyID, 10))
+	a.getClientKeySecret(legacySecret, legacyRequest)
+	if legacySecret.Code != http.StatusConflict || !strings.Contains(legacySecret.Body.String(), "client_key_not_recoverable") {
+		t.Fatalf("legacy client key should report unrecoverable: %d %s", legacySecret.Code, legacySecret.Body.String())
 	}
 }
 

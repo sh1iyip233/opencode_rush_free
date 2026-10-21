@@ -368,13 +368,14 @@ CREATE TABLE IF NOT EXISTS models (id INTEGER PRIMARY KEY AUTOINCREMENT, model_i
 CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, resolved_model TEXT, client_key_id INTEGER, client_key_name TEXT, client_name TEXT, client_user_agent TEXT, stream INTEGER, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT 'builtin', attempt_summary TEXT, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS session_proxy_routes (session_key TEXT PRIMARY KEY, proxy_id INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS resin_session_routes (session_key TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, request_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS client_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_hint TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, maintenance_allowed INTEGER NOT NULL DEFAULT 0, expires_at TEXT, rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0, last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS client_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_hint TEXT NOT NULL DEFAULT '', encrypted_key TEXT, enabled INTEGER NOT NULL DEFAULT 1, maintenance_allowed INTEGER NOT NULL DEFAULT 0, expires_at TEXT, rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0, last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_policies (model_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS force_free_models (model_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_aliases (id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL UNIQUE, target_model_id TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL, event_type TEXT NOT NULL, severity TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);
 CREATE TABLE IF NOT EXISTS proxy_probe_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, mode TEXT NOT NULL, total INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS proxy_probe_results (job_id TEXT NOT NULL, proxy_id INTEGER NOT NULL, uri TEXT NOT NULL, exit_ok INTEGER NOT NULL DEFAULT 0, exit_ip TEXT, exit_latency_ms INTEGER, upstream_status TEXT, error TEXT, PRIMARY KEY(job_id,proxy_id), FOREIGN KEY(job_id) REFERENCES proxy_probe_jobs(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS proxy_probe_results (job_id TEXT NOT NULL, proxy_id INTEGER NOT NULL, uri TEXT NOT NULL, exit_ok INTEGER NOT NULL DEFAULT 0, exit_ip TEXT, exit_latency_ms INTEGER, upstream_status TEXT, error TEXT, verdict TEXT, PRIMARY KEY(job_id,proxy_id), FOREIGN KEY(job_id) REFERENCES proxy_probe_jobs(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS proxy_model_bans (proxy_id INTEGER NOT NULL, model_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'suspect', consecutive_failures INTEGER NOT NULL DEFAULT 0, banned_until TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(proxy_id,model_id));
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model);`)
 	if err != nil {
 		return err
@@ -397,12 +398,14 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"ALTER TABLE usage_requests ADD COLUMN stream INTEGER",
 		"ALTER TABLE usage_requests ADD COLUMN attempt_summary TEXT",
 		"ALTER TABLE client_keys ADD COLUMN maintenance_allowed INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE client_keys ADD COLUMN encrypted_key TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_probe_at TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_probe_latency_ms INTEGER",
 		"ALTER TABLE proxies ADD COLUMN last_exit_ip TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_probe_error TEXT",
 		"ALTER TABLE proxies ADD COLUMN upstream_probe_at TEXT",
 		"ALTER TABLE proxies ADD COLUMN upstream_probe_status TEXT",
+		"ALTER TABLE proxy_probe_results ADD COLUMN verdict TEXT",
 	} {
 		if _, alterErr := db.Exec(statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			return alterErr
@@ -421,6 +424,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"CREATE INDEX IF NOT EXISTS idx_client_keys_hash ON client_keys(key_hash)",
 		"CREATE INDEX IF NOT EXISTS idx_alert_events_due ON alert_events(status,next_attempt_at)",
 		"CREATE INDEX IF NOT EXISTS idx_proxy_probe_jobs_expires ON proxy_probe_jobs(expires_at)",
+		"CREATE INDEX IF NOT EXISTS idx_proxy_model_bans_until ON proxy_model_bans(banned_until)",
 	} {
 		if _, indexErr := db.Exec(statement); indexErr != nil {
 			return indexErr
@@ -518,8 +522,24 @@ func (a *App) ensureClientKey() error {
 		if e != nil {
 			return e
 		}
-		_, e = a.db.Exec("INSERT INTO settings(key,value) VALUES('client_key',?)", hashToken(key))
-		return e
+		encrypted, e := a.encrypt(key)
+		if e != nil {
+			return e
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		tx, e := a.db.Begin()
+		if e != nil {
+			return e
+		}
+		if _, e = tx.Exec("INSERT INTO settings(key,value) VALUES('client_key',?)", hashToken(key)); e != nil {
+			_ = tx.Rollback()
+			return e
+		}
+		if _, e = tx.Exec("INSERT INTO client_keys(name,key_hash,key_hint,encrypted_key,enabled,created_at,updated_at) VALUES('Legacy',?,?,?,?,?,?)", hashToken(key), clientKeyHint(key), encrypted, 1, now, now); e != nil {
+			_ = tx.Rollback()
+			return e
+		}
+		return tx.Commit()
 	}
 	return err
 }
@@ -662,9 +682,10 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/settings/maintenance", a.requireAdmin(a.getMaintenanceSettings))
 	mux.HandleFunc("PUT /api/settings/maintenance", a.requireAdmin(a.putMaintenanceSettings))
 	mux.HandleFunc("POST /api/settings/upstream/test", a.requireAdmin(a.testUpstream))
-	mux.HandleFunc("POST /api/settings/client-key/rotate", a.requireAdmin(a.rotateClientKey))
+	mux.HandleFunc("POST /api/settings/client-key/rotate", a.requireAdmin(a.retiredClientKeyRotation))
 	mux.HandleFunc("GET /api/client-keys", a.requireAdmin(a.listClientKeys))
 	mux.HandleFunc("POST /api/client-keys", a.requireAdmin(a.createClientKey))
+	mux.HandleFunc("GET /api/client-keys/{id}/secret", a.requireAdmin(a.getClientKeySecret))
 	mux.HandleFunc("PATCH /api/client-keys/{id}", a.requireAdmin(a.patchClientKey))
 	mux.HandleFunc("DELETE /api/client-keys/{id}", a.requireAdmin(a.deleteClientKey))
 	mux.HandleFunc("POST /api/client-keys/{id}/rotate", a.requireAdmin(a.rotateNamedClientKey))
@@ -1537,6 +1558,10 @@ func boolInt(v bool) int {
 	return 0
 }
 func classifyFree(id string, m map[string]any) (bool, string) {
+	if modelDeprecated(m) {
+		// A retired model is never a usable target, however it is priced.
+		return false, ""
+	}
 	lowerID := strings.ToLower(id)
 	suffix := strings.HasSuffix(lowerID, ":free") || strings.HasSuffix(lowerID, "-free")
 	pricingZero := false
@@ -1562,6 +1587,32 @@ func classifyFree(id string, m map[string]any) (bool, string) {
 	}
 	return false, ""
 }
+
+// modelDeprecated reports whether the upstream marks the model as retired. A
+// deprecated model keeps its zero pricing, so without this check it would be
+// advertised as free and then fail every request routed to it.
+func modelDeprecated(m map[string]any) bool {
+	if value, ok := m["deprecated"]; ok {
+		switch typed := value.(type) {
+		case bool:
+			return typed
+		case string:
+			return strings.EqualFold(strings.TrimSpace(typed), "true")
+		}
+	}
+	for _, key := range []string{"status", "state", "lifecycle"} {
+		text, ok := m[key].(string)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "deprecated", "retired", "sunset", "disabled", "removed":
+			return true
+		}
+	}
+	return false
+}
+
 func priceZero(v any) bool {
 	switch x := v.(type) {
 	case float64:
@@ -1708,7 +1759,12 @@ func usageClientUserAgent(r *http.Request) string {
 	return strings.TrimSpace(r.UserAgent())
 }
 
-func sessionKey(r *http.Request, user json.RawMessage) string {
+// sessionKey derives the rotation affinity of a request. An explicit session
+// header wins, then the OpenAI user field, and finally the opening user message:
+// without that last fallback a client that sends neither gets no stickiness at
+// all, so every request lands on a different exit and the upstream prompt cache
+// has to be rebuilt each time.
+func sessionKey(r *http.Request, user json.RawMessage, messages []any) string {
 	sessionID := ""
 	for _, header := range []string{"X-Relay-Session-ID", "X-OpenCode-Session-ID", "X-Session-ID"} {
 		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
@@ -1721,10 +1777,68 @@ func sessionKey(r *http.Request, user json.RawMessage) string {
 		sessionID = strings.TrimSpace(sessionID)
 	}
 	if sessionID == "" {
+		sessionID = firstUserMessageFingerprint(messages)
+	}
+	if sessionID == "" {
 		return ""
 	}
 	clientID := hashToken(clientCredential(r))
 	return hashToken(clientID + "\x00" + sessionID)
+}
+
+// firstUserMessageFingerprint identifies a conversation by its opening user
+// message. That message stays the same on every later turn, so it works as a
+// session key when the client sends no identifier of its own. Only a conversation
+// that already has a second user turn qualifies: a one-shot prompt would
+// otherwise create one session route row per request and never reuse it.
+func firstUserMessageFingerprint(messages []any) string {
+	userTurns := 0
+	opening := ""
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := message["role"].(string); !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		userTurns++
+		if opening == "" {
+			opening = messageText(message["content"])
+		}
+	}
+	if userTurns < 2 || opening == "" {
+		return ""
+	}
+	if len(opening) > 512 {
+		opening = opening[:512]
+	}
+	return "message:" + hashToken(opening)
+}
+
+// messageText flattens message content to its text parts. Image parts are
+// skipped so a conversation that opens with a picture still keys on its words.
+func messageText(content any) string {
+	switch value := content.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, part := range value {
+			item, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if kind, _ := item["type"].(string); kind != "" && kind != "text" {
+				continue
+			}
+			if text, ok := item["text"].(string); ok {
+				parts = append(parts, text)
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	}
+	return ""
 }
 
 func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
@@ -1830,7 +1944,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	requestSessionKey := sessionKey(r, parsed.User)
+	requestSessionKey := sessionKey(r, parsed.User, parsed.Messages)
 	var resinRoute *resinRequestRoute
 	if resinMode {
 		resinRoute, err = newResinRequestRoute(requestSessionKey)
@@ -1850,6 +1964,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	lastProxyURI := ""
 	retryCount := 0
 	used := map[int64]struct{}{}
+	// A ban is a refusal of one exit and model pairing, not of the exit, so the
+	// banned set is loaded per request and only used to order candidates.
+	banned := a.bannedProxyIDs(resolvedModel)
 	attemptSummary := []map[string]any{}
 	for i := 0; i < attempts; i++ {
 		if requestErr := r.Context().Err(); requestErr != nil {
@@ -1866,7 +1983,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			var ok bool
-			p, ok, err = a.pickSessionProxy(requestSessionKey, proxies, used)
+			p, ok, err = a.pickSessionProxy(proxyPick{proxies: proxies, sessionKey: requestSessionKey, model: resolvedModel, used: used, banned: banned})
 			if err != nil {
 				lastErr = err
 				break
@@ -1953,10 +2070,16 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				}
 				lastErr = fmt.Errorf("vision helper failed: %s", detail)
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
-				if cfg.VisionUseProxy && helpStatus == http.StatusTooManyRequests && i+1 < attempts {
+				if cfg.VisionUseProxy && i+1 < attempts && (helpStatus == http.StatusTooManyRequests || helpStatus == http.StatusUnauthorized || helpStatus == http.StatusForbidden) {
 					if resinMode {
 						_ = resinRoute.advance(a)
 					} else {
+						if classifyUpstreamOutcome(helpStatus) == upstreamOutcomeRefused {
+							a.markModelRefusal(p.ID, resolvedModel)
+							banned = a.bannedProxyIDs(resolvedModel)
+						} else {
+							a.markProxyLimited(p.ID, retryAfterDuration(helpResp))
+						}
 						a.clearSessionProxy(requestSessionKey, p.ID)
 					}
 					continue
@@ -2003,11 +2126,30 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if resinMode {
 			a.resinSuccess()
-		} else if resp.StatusCode == http.StatusProxyAuthRequired {
-			a.markProxyFailure(p.ID)
-			a.clearSessionProxy(requestSessionKey, p.ID)
-		} else if resp.StatusCode < 500 {
-			a.markProxySuccess(p.ID)
+		} else {
+			switch classifyUpstreamOutcome(resp.StatusCode) {
+			case upstreamOutcomeSuccess:
+				a.markProxySuccess(p.ID)
+			case upstreamOutcomeLimited:
+				// The per-IP quota is spent, so the whole exit cools — honouring
+				// the wait the upstream asked for when it is longer than ours.
+				a.markProxyLimited(p.ID, retryAfterDuration(resp))
+				a.clearSessionProxy(requestSessionKey, p.ID)
+			case upstreamOutcomeRefused:
+				// 401/403 refuse this exit for this model only. The link itself
+				// is fine, so the exit stays in rotation for every other model.
+				a.markModelRefusal(p.ID, resolvedModel)
+				banned = a.bannedProxyIDs(resolvedModel)
+				a.clearSessionProxy(requestSessionKey, p.ID)
+			case upstreamOutcomeProxyAuth:
+				a.markProxyFailure(p.ID)
+				a.clearSessionProxy(requestSessionKey, p.ID)
+			case upstreamOutcomeServerError:
+				// A 5xx is usually the model failing behind a healthy exit. Leave
+				// the exit healthy, but drop the sticky route so the retry may
+				// land on a different exit.
+				a.clearSessionProxy(requestSessionKey, p.ID)
+			}
 		}
 		if resp.StatusCode == http.StatusProxyAuthRequired && !resinMode {
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "error": "proxy authentication failed", "latency_ms": time.Since(start).Milliseconds()})
@@ -2026,10 +2168,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				_ = resp.Body.Close()
 				continue
 			}
-		} else if resp.StatusCode == http.StatusTooManyRequests {
-			a.clearSessionProxy(requestSessionKey, p.ID)
 		}
-		if retryableUpstreamStatus(resp.StatusCode) && i+1 < attempts && !resinMode {
+		if shouldRotateUpstream(resp.StatusCode) && i+1 < attempts && !resinMode {
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
@@ -2041,6 +2181,13 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start, suppressReasoning)
+		if copyErr != nil && !resinMode && r.Context().Err() == nil && isProxyTransportError(copyErr) {
+			// The stream broke mid-flight. It is never replayed — the client has
+			// already received bytes — but the exit earns a transport strike so
+			// the next request prefers a different one.
+			a.markProxyFailure(p.ID)
+			a.clearSessionProxy(requestSessionKey, p.ID)
+		}
 		var proxyID *int64
 		if p.ID > 0 {
 			proxyID = &p.ID
@@ -2883,20 +3030,11 @@ func (a *App) loadAvailableProxiesFromDB() ([]ProxyRecord, error) {
 		}
 		p.Enabled = en == 1
 		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
-		if cool != "" {
-			t, _ := time.Parse(time.RFC3339, cool)
-			p.CooldownUntil = &t
-			if t.After(time.Now()) {
-				continue
-			}
-		}
-		if expires != "" {
-			t, _ := time.Parse(time.RFC3339, expires)
-			p.ExpiresAt = &t
-			if !t.After(time.Now().UTC()) {
-				continue
-			}
-		}
+		// Cooling and expired exits stay in the snapshot. The pool filters them
+		// by time on every pick, so an exit whose cooldown ends returns to
+		// rotation immediately instead of waiting for an unrelated cache flush.
+		p.CooldownUntil = parseStoredTime(cool)
+		p.ExpiresAt = parseStoredTime(expires)
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -2977,6 +3115,11 @@ func (a *App) expiredProxyJanitor() {
 		if _, err := a.db.Exec("DELETE FROM proxy_probe_results WHERE job_id NOT IN (SELECT id FROM proxy_probe_jobs)"); err != nil {
 			log.Printf("delete expired probe results failed: %v", err)
 		}
+		// A pairing ban expires on its own, but the row has to go too or the
+		// table grows without bound and a stale suspect could resurrect.
+		if _, err := a.db.Exec("DELETE FROM proxy_model_bans WHERE (banned_until IS NOT NULL AND banned_until<=?) OR updated_at<=?", time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Add(-24*time.Hour).Format(time.RFC3339)); err != nil {
+			log.Printf("delete expired model bans failed: %v", err)
+		}
 	}
 }
 
@@ -3002,46 +3145,86 @@ func (a *App) evaluateAlertConditions() {
 	a.evaluateGatewayAlerts(now, engine, active)
 }
 
-func (a *App) pickSessionProxy(key string, proxies []ProxyRecord, used map[int64]struct{}) (ProxyRecord, bool, error) {
+// proxyPick is one rotation decision: the candidate exits, which session is
+// asking, which model it asks for, which exits this request already spent, and
+// which exit and model pairings are banned.
+type proxyPick struct {
+	proxies    []ProxyRecord
+	sessionKey string
+	model      string
+	used       map[int64]struct{}
+	banned     map[int64]struct{}
+}
+
+func (p proxyPick) eligible(proxy ProxyRecord, skipBanned bool) bool {
+	if _, skipped := p.used[proxy.ID]; skipped {
+		return false
+	}
+	if skipBanned {
+		if _, banned := p.banned[proxy.ID]; banned {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) pickSessionProxy(pick proxyPick) (ProxyRecord, bool, error) {
 	var routeLock *sync.Mutex
-	if key != "" {
-		routeLock = &a.routingLocks[sessionRouteLockIndex(key)]
+	if pick.sessionKey != "" {
+		routeLock = &a.routingLocks[sessionRouteLockIndex(pick.sessionKey)]
 		routeLock.Lock()
 		defer routeLock.Unlock()
 	}
-	if key != "" {
+	if pick.sessionKey != "" {
 		limit := a.sessionProxyRequestLimit()
 		var currentID int64
 		var requestCount int
-		err := a.db.QueryRow("SELECT proxy_id,request_count FROM session_proxy_routes WHERE session_key=?", key).Scan(&currentID, &requestCount)
+		err := a.db.QueryRow("SELECT proxy_id,request_count FROM session_proxy_routes WHERE session_key=?", pick.sessionKey).Scan(&currentID, &requestCount)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return ProxyRecord{}, false, err
 		}
-		for _, candidate := range proxies {
-			if candidate.ID == currentID {
-				if _, skipped := used[candidate.ID]; !skipped && (limit == 0 || requestCount < limit) {
-					if _, err := a.db.Exec("UPDATE session_proxy_routes SET request_count=request_count+1,updated_at=? WHERE session_key=? AND proxy_id=?", time.Now().UTC().Format(time.RFC3339), key, candidate.ID); err != nil {
-						return ProxyRecord{}, false, err
-					}
-					return candidate, true, nil
-				}
-				break
+		for _, candidate := range pick.proxies {
+			if candidate.ID != currentID {
+				continue
 			}
+			if pick.eligible(candidate, true) && (limit == 0 || requestCount < limit) {
+				if _, err := a.db.Exec("UPDATE session_proxy_routes SET request_count=request_count+1,updated_at=? WHERE session_key=? AND proxy_id=?", time.Now().UTC().Format(time.RFC3339), pick.sessionKey, candidate.ID); err != nil {
+					return ProxyRecord{}, false, err
+				}
+				return candidate, true, nil
+			}
+			break
 		}
 	}
-	eligible := make([]ProxyRecord, 0, len(proxies))
-	for _, candidate := range proxies {
-		if _, skipped := used[candidate.ID]; !skipped {
-			eligible = append(eligible, candidate)
-		}
-	}
-	if len(eligible) == 0 {
+	if len(pick.proxies) == 0 {
 		return ProxyRecord{}, false, nil
 	}
-	selected := eligible[(int(a.rr.Add(1))-1)%len(eligible)]
-	if key != "" {
+	// The cursor advances once per decision and is taken modulo the whole pool,
+	// so excluding spent or banned exits can never skew round-robin fairness.
+	start := int(a.rr.Add(1) - 1)
+	choose := func(skipBanned bool) (ProxyRecord, bool) {
+		for offset := 0; offset < len(pick.proxies); offset++ {
+			candidate := pick.proxies[(start+offset)%len(pick.proxies)]
+			if !pick.eligible(candidate, skipBanned) {
+				continue
+			}
+			return candidate, true
+		}
+		return ProxyRecord{}, false
+	}
+	selected, ok := choose(true)
+	if !ok {
+		// Every remaining exit is banned for this model. One attempt on a banned
+		// pairing beats failing the request without trying at all, and the ban
+		// itself expires, so this cannot loop forever.
+		selected, ok = choose(false)
+	}
+	if !ok {
+		return ProxyRecord{}, false, nil
+	}
+	if pick.sessionKey != "" {
 		now := time.Now().UTC().Format(time.RFC3339)
-		if _, err := a.db.Exec(`INSERT INTO session_proxy_routes(session_key,proxy_id,request_count,created_at,updated_at) VALUES(?,?,1,?,?) ON CONFLICT(session_key) DO UPDATE SET proxy_id=excluded.proxy_id,request_count=1,updated_at=excluded.updated_at`, key, selected.ID, now, now); err != nil {
+		if _, err := a.db.Exec(`INSERT INTO session_proxy_routes(session_key,proxy_id,request_count,created_at,updated_at) VALUES(?,?,1,?,?) ON CONFLICT(session_key) DO UPDATE SET proxy_id=excluded.proxy_id,request_count=1,updated_at=excluded.updated_at`, pick.sessionKey, selected.ID, now, now); err != nil {
 			return ProxyRecord{}, false, err
 		}
 	}
@@ -3059,25 +3242,114 @@ func (a *App) clearSessionProxy(key string, proxyID int64) {
 		log.Printf("clear session proxy failed: %v", err)
 	}
 }
+
+// proxyFailureUpdateSQL escalates an exit cooldown in a single statement. The
+// previous read-modify-write lost concurrent failures, so a burst of 429s on one
+// exit could fail to escalate and keep re-picking it.
+const proxyFailureUpdateSQL = `UPDATE proxies
+SET failure_count = failure_count + 1,
+    health_status = 'cooldown',
+    cooldown_until = strftime('%Y-%m-%dT%H:%M:%SZ','now',CASE
+        WHEN failure_count + 1 >= 6 THEN '+30 minutes'
+        WHEN failure_count + 1 = 5 THEN '+16 minutes'
+        WHEN failure_count + 1 = 4 THEN '+8 minutes'
+        WHEN failure_count + 1 = 3 THEN '+4 minutes'
+        WHEN failure_count + 1 = 2 THEN '+2 minutes'
+        ELSE '+1 minutes' END),
+    updated_at = ?
+WHERE id = ?`
+
 func (a *App) markProxyFailure(id int64) {
-	var previous int
-	if err := a.db.QueryRow("SELECT failure_count FROM proxies WHERE id=?", id).Scan(&previous); err != nil {
-		log.Printf("load proxy failure count failed: %v", err)
-		return
-	}
-	failures := previous + 1
-	delay := time.Minute * time.Duration(1<<min(failures-1, 5))
-	if delay > 30*time.Minute {
-		delay = 30 * time.Minute
-	}
-	cooldown := time.Now().UTC().Add(delay)
-	if _, err := a.db.Exec("UPDATE proxies SET health_status='cooldown',failure_count=?,cooldown_until=?,updated_at=? WHERE id=?", failures, cooldown.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), id); err != nil {
+	a.coolProxy(id, 0)
+}
+
+// markProxyLimited cools the exit whose per-IP quota is exhausted. The wait the
+// upstream asked for wins over the local backoff when it is longer.
+func (a *App) markProxyLimited(id int64, retryAfter time.Duration) {
+	a.coolProxy(id, retryAfter)
+}
+
+func (a *App) coolProxy(id int64, minCooldown time.Duration) {
+	now := time.Now().UTC()
+	if _, err := a.db.Exec(proxyFailureUpdateSQL, now.Format(time.RFC3339), id); err != nil {
 		log.Printf("mark proxy failure failed: %v", err)
 		return
 	}
+	var failures int
+	var stored string
+	if err := a.db.QueryRow("SELECT failure_count,COALESCE(cooldown_until,'') FROM proxies WHERE id=?", id).Scan(&failures, &stored); err != nil {
+		log.Printf("load proxy failure state failed: %v", err)
+		return
+	}
+	cooldown := parseStoredTime(stored)
+	if minCooldown > maxProxyCooldown {
+		minCooldown = maxProxyCooldown
+	}
+	if cooldown != nil && minCooldown > 0 && cooldown.Sub(now) < minCooldown {
+		extended := now.Add(minCooldown)
+		if _, err := a.db.Exec("UPDATE proxies SET cooldown_until=?,updated_at=? WHERE id=?", extended.Format(time.RFC3339), now.Format(time.RFC3339), id); err != nil {
+			log.Printf("extend proxy cooldown failed: %v", err)
+			return
+		}
+		cooldown = &extended
+	}
 	a.initializeRuntimeServices()
-	a.proxyRuntime.replaceHealth(id, "cooldown", failures, &cooldown)
+	a.proxyRuntime.replaceHealth(id, "cooldown", failures, cooldown)
 }
+
+// markModelRefusal records a 401 or 403 against one exit and model pairing. The
+// first refusal is only suspect; a second one bans the pairing for a short
+// window. The exit is never cooled here: the link is healthy, and cooling it
+// would remove a working exit from rotation for every other model.
+func (a *App) markModelRefusal(proxyID int64, model string) {
+	model = strings.TrimSpace(model)
+	if proxyID <= 0 || model == "" {
+		return
+	}
+	now := time.Now().UTC()
+	var failures int
+	if err := a.db.QueryRow("SELECT consecutive_failures FROM proxy_model_bans WHERE proxy_id=? AND model_id=?", proxyID, model).Scan(&failures); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		log.Printf("load model ban state failed: %v", err)
+		return
+	}
+	failures++
+	state := "suspect"
+	var bannedUntil any
+	if failures >= modelBanConfirmations {
+		state = "banned"
+		bannedUntil = now.Add(modelBanWindow).Format(time.RFC3339)
+	}
+	if _, err := a.db.Exec(`INSERT INTO proxy_model_bans(proxy_id,model_id,state,consecutive_failures,banned_until,updated_at) VALUES(?,?,?,?,?,?)
+ON CONFLICT(proxy_id,model_id) DO UPDATE SET state=excluded.state,consecutive_failures=excluded.consecutive_failures,banned_until=excluded.banned_until,updated_at=excluded.updated_at`,
+		proxyID, model, state, failures, bannedUntil, now.Format(time.RFC3339)); err != nil {
+		log.Printf("record model refusal failed: %v", err)
+	}
+}
+
+// bannedProxyIDs lists the exits currently banned for one model. A read failure
+// yields no bans: rotation has to keep working even when bookkeeping fails.
+func (a *App) bannedProxyIDs(model string) map[int64]struct{} {
+	out := map[int64]struct{}{}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return out
+	}
+	rows, err := a.db.Query("SELECT proxy_id FROM proxy_model_bans WHERE model_id=? AND banned_until IS NOT NULL AND banned_until>?", model, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		log.Printf("load model bans failed: %v", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return out
+		}
+		out[id] = struct{}{}
+	}
+	return out
+}
+
 func (a *App) markProxySuccess(id int64) {
 	if _, err := a.db.Exec("UPDATE proxies SET health_status='healthy',failure_count=0,cooldown_until=NULL,updated_at=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), id); err != nil {
 		log.Printf("mark proxy success failed: %v", err)
@@ -4110,6 +4382,40 @@ func (a *App) rotateEncryptionKey(previousKey []byte) (int, error) {
 		}
 		if changed {
 			if _, err = tx.Exec("UPDATE proxies SET encrypted_password=? WHERE id=?", value, item.id); err != nil {
+				return rollback(err)
+			}
+			migrated++
+		}
+	}
+	type clientKeyValue struct {
+		id    int64
+		value string
+	}
+	clientKeys := []clientKeyValue{}
+	rows, err = tx.Query("SELECT id,COALESCE(encrypted_key,'') FROM client_keys WHERE COALESCE(encrypted_key,'')<>''")
+	if err != nil {
+		return rollback(err)
+	}
+	for rows.Next() {
+		var item clientKeyValue
+		if err = rows.Scan(&item.id, &item.value); err != nil {
+			_ = rows.Close()
+			return rollback(err)
+		}
+		clientKeys = append(clientKeys, item)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return rollback(err)
+	}
+	_ = rows.Close()
+	for _, item := range clientKeys {
+		value, changed, rotateErr := rotate(item.value)
+		if rotateErr != nil {
+			return rollback(fmt.Errorf("client key %d: %w", item.id, rotateErr))
+		}
+		if changed {
+			if _, err = tx.Exec("UPDATE client_keys SET encrypted_key=? WHERE id=?", value, item.id); err != nil {
 				return rollback(err)
 			}
 			migrated++

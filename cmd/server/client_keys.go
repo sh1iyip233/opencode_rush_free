@@ -19,6 +19,7 @@ type ClientKey struct {
 	ID                 int64      `json:"id"`
 	Name               string     `json:"name"`
 	Hint               string     `json:"hint"`
+	Recoverable        bool       `json:"recoverable"`
 	Enabled            bool       `json:"enabled"`
 	MaintenanceAllowed bool       `json:"maintenance_allowed"`
 	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
@@ -209,10 +210,11 @@ type clientKeyScanner interface {
 func scanClientKey(row clientKeyScanner) (*ClientKey, error) {
 	var key ClientKey
 	var enabled, maintenanceAllowed int
-	var expires, lastUsed, created string
-	if err := row.Scan(&key.ID, &key.Name, &key.Hint, &enabled, &maintenanceAllowed, &expires, &key.RPMLimit, &key.TPMLimit, &lastUsed, &created); err != nil {
+	var encrypted, expires, lastUsed, created string
+	if err := row.Scan(&key.ID, &key.Name, &key.Hint, &encrypted, &enabled, &maintenanceAllowed, &expires, &key.RPMLimit, &key.TPMLimit, &lastUsed, &created); err != nil {
 		return nil, err
 	}
+	key.Recoverable = encrypted != ""
 	key.Enabled = enabled == 1
 	key.MaintenanceAllowed = maintenanceAllowed == 1
 	key.ExpiresAt = parseStoredTime(expires)
@@ -269,7 +271,7 @@ func (a *App) touchClientKey(key *ClientKey) {
 }
 
 func (a *App) listClientKeys(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT id,name,key_hint,enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys ORDER BY id")
+	rows, err := a.db.Query("SELECT id,name,key_hint,COALESCE(encrypted_key,''),enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys ORDER BY id")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query client keys"})
 		return
@@ -336,14 +338,19 @@ func (a *App) createClientKey(w http.ResponseWriter, r *http.Request) {
 	if expires != nil {
 		expiresValue = expires.Format(time.RFC3339)
 	}
-	result, err := a.db.Exec("INSERT INTO client_keys(name,key_hash,key_hint,enabled,expires_at,rpm_limit,tpm_limit,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", strings.TrimSpace(in.Name), hashToken(plain), clientKeyHint(plain), 1, expiresValue, in.RPMLimit, in.TPMLimit, now.Format(time.RFC3339), now.Format(time.RFC3339))
+	encrypted, err := a.encrypt(plain)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "could not encrypt client key"})
+		return
+	}
+	result, err := a.db.Exec("INSERT INTO client_keys(name,key_hash,key_hint,encrypted_key,enabled,expires_at,rpm_limit,tpm_limit,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", strings.TrimSpace(in.Name), hashToken(plain), clientKeyHint(plain), encrypted, 1, expiresValue, in.RPMLimit, in.TPMLimit, now.Format(time.RFC3339), now.Format(time.RFC3339))
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not create client key"})
 		return
 	}
 	id, _ := result.LastInsertId()
 	a.invalidateClientKeyCache()
-	writeJSON(w, 201, map[string]any{"id": id, "client_key": plain, "warning": "copy this key now; it will not be shown again"})
+	writeJSON(w, 201, map[string]any{"id": id, "client_key": plain, "warning": "copy this key now or reveal it later from the Client Key list"})
 }
 
 func (a *App) clientKeyID(r *http.Request) (int64, error) {
@@ -421,7 +428,39 @@ func (a *App) patchClientKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) loadClientKey(id int64) (*ClientKey, error) {
-	return scanClientKey(a.db.QueryRow("SELECT id,name,key_hint,enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys WHERE id=?", id))
+	return scanClientKey(a.db.QueryRow("SELECT id,name,key_hint,COALESCE(encrypted_key,''),enabled,maintenance_allowed,COALESCE(expires_at,''),rpm_limit,tpm_limit,COALESCE(last_used_at,''),created_at FROM client_keys WHERE id=?", id))
+}
+
+func (a *App) getClientKeySecret(w http.ResponseWriter, r *http.Request) {
+	id, err := a.clientKeyID(r)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid client key id"})
+		return
+	}
+
+	var hash, encrypted string
+	err = a.db.QueryRow("SELECT key_hash,COALESCE(encrypted_key,'') FROM client_keys WHERE id=?", id).Scan(&hash, &encrypted)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "client key not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not load client key"})
+		return
+	}
+	if encrypted == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "client key cannot be recovered; rotate it to create a recoverable replacement",
+			"code":  "client_key_not_recoverable",
+		})
+		return
+	}
+	plain, err := a.decrypt(encrypted)
+	if err != nil || subtle.ConstantTimeCompare([]byte(hashToken(plain)), []byte(hash)) != 1 {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not decrypt client key"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"client_key": plain})
 }
 
 func (a *App) deleteClientKey(w http.ResponseWriter, r *http.Request) {
@@ -468,8 +507,13 @@ func (a *App) rotateNamedClientKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not generate client key"})
 		return
 	}
+	encrypted, err := a.encrypt(plain)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "could not encrypt client key"})
+		return
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := a.db.Exec("UPDATE client_keys SET key_hash=?,key_hint=?,updated_at=? WHERE id=?", hashToken(plain), clientKeyHint(plain), now, id); err != nil {
+	if _, err := a.db.Exec("UPDATE client_keys SET key_hash=?,key_hint=?,encrypted_key=?,updated_at=? WHERE id=?", hashToken(plain), clientKeyHint(plain), encrypted, now, id); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not rotate client key"})
 		return
 	}
@@ -477,22 +521,14 @@ func (a *App) rotateNamedClientKey(w http.ResponseWriter, r *http.Request) {
 	if key.Name == "Legacy" {
 		_, _ = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('client_key',?)", hashToken(plain))
 	}
-	writeJSON(w, 200, map[string]any{"client_key": plain, "warning": "copy this key now; it will not be shown again"})
+	writeJSON(w, 200, map[string]any{"client_key": plain, "warning": "copy this key now or reveal it later from the Client Key list"})
 }
 
-func (a *App) rotateClientKey(w http.ResponseWriter, r *http.Request) {
-	if err := a.migrateLegacyClientKey(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not migrate the legacy client key"})
-		return
-	}
-	var id int64
-	if err := a.db.QueryRow("SELECT id FROM client_keys WHERE name='Legacy' ORDER BY id LIMIT 1").Scan(&id); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not find the legacy client key"})
-		return
-	}
-	clone := r.Clone(r.Context())
-	clone.SetPathValue("id", strconv.FormatInt(id, 10))
-	a.rotateNamedClientKey(w, clone)
+func (a *App) retiredClientKeyRotation(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusGone, map[string]string{
+		"error": "this endpoint has been retired; rotate a specific client key with POST /api/client-keys/{id}/rotate",
+		"code":  "client_key_rotation_endpoint_retired",
+	})
 }
 
 func (a *App) recordGatewayUsage(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, requestErr error) {

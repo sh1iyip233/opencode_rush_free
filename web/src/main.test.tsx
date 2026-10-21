@@ -330,8 +330,8 @@ describe("运维操作", () => {
       const path = String(input);
       if (path === "/api/client-keys" && (!init?.method || init.method === "GET")) {
         return json([
-          { id: 1, name: "Legacy", hint: "legacy", enabled: true, rpm_limit: 0, tpm_limit: 0 },
-          { id: 2, name: "CI", hint: "ocp...test", enabled: true, rpm_limit: 10, tpm_limit: 0 },
+          { id: 1, name: "Legacy", hint: "legacy", recoverable: false, enabled: true, rpm_limit: 0, tpm_limit: 0 },
+          { id: 2, name: "CI", hint: "ocp...test", recoverable: true, enabled: true, rpm_limit: 10, tpm_limit: 0 },
         ]);
       }
       if (path === "/api/client-keys/2" && init?.method === "DELETE") return json({ ok: true });
@@ -346,6 +346,70 @@ describe("运维操作", () => {
       "/api/client-keys/2",
       expect.objectContaining({ method: "DELETE" }),
     ));
+  });
+
+  it("按需显示、隐藏并复制可恢复的客户端 Key", async () => {
+    const clipboard = { writeText: vi.fn(async () => {}) };
+    Object.assign(navigator, { clipboard });
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/client-keys" && (!init?.method || init.method === "GET")) {
+        return json([
+          { id: 2, name: "Deploy", hint: "ocp...test", recoverable: true, enabled: true, maintenance_allowed: false, rpm_limit: 0, tpm_limit: 0 },
+          { id: 3, name: "Legacy", hint: "legacy", recoverable: false, enabled: true, maintenance_allowed: false, rpm_limit: 0, tpm_limit: 0 },
+        ]);
+      }
+      if (path === "/api/client-keys/2/secret") return json({ client_key: "ocp-visible-secret" });
+      return json({});
+    });
+    render(<ClientKeysPanel notify={vi.fn()} />);
+    const deploy = await screen.findByText("Deploy");
+    const row = deploy.closest(".key-row")!;
+
+    expect(screen.queryByText("ocp-visible-secret")).not.toBeInTheDocument();
+    fireEvent.click(row.querySelector("button[title='显示 Key']")!);
+    expect(await screen.findByText("ocp-visible-secret")).toBeInTheDocument();
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith("/api/client-keys/2/secret", expect.anything());
+
+    fireEvent.click(row.querySelector("button[title='复制 Key']")!);
+    await waitFor(() => expect(clipboard.writeText).toHaveBeenCalledWith("ocp-visible-secret"));
+
+    fireEvent.click(row.querySelector("button[title='隐藏 Key']")!);
+    expect(screen.queryByText("ocp-visible-secret")).not.toBeInTheDocument();
+    expect(screen.getByText("旧 Key 无法查看")).toBeInTheDocument();
+  });
+
+  it("创建和轮换后在对应 Key 行展示新密钥", async () => {
+    let keys = [{ id: 7, name: "CI", hint: "ocp...old", recoverable: true, enabled: true, maintenance_allowed: false, rpm_limit: 0, tpm_limit: 0 }];
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/client-keys" && (!init?.method || init.method === "GET")) return json(keys);
+      if (path === "/api/client-keys" && init?.method === "POST") {
+        keys = [...keys, { id: 8, name: "New", hint: "ocp...new", recoverable: true, enabled: true, maintenance_allowed: false, rpm_limit: 0, tpm_limit: 0 }];
+        return json({ id: 8, client_key: "ocp-new-secret" }, 201);
+      }
+      if (path === "/api/client-keys/7/rotate" && init?.method === "POST") return json({ client_key: "ocp-rotated-secret" });
+      return json({});
+    });
+    render(<ClientKeysPanel notify={vi.fn()} />);
+    await screen.findByText("CI");
+
+    fireEvent.change(screen.getByPlaceholderText("例如 CI"), { target: { value: "New" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建 Key" }));
+    expect(await screen.findByText("ocp-new-secret")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("CI").closest(".key-row")!.querySelector("button[title='轮换 Key']")!);
+    expect(await screen.findByText("ocp-rotated-secret")).toBeInTheDocument();
+  });
+
+  it("网关卡片仅提供地址和客户端 Key 管理入口", async () => {
+    render(<Models models={[]} upstream={{}} reload={async () => true} notify={vi.fn()} />);
+    const gateway = document.querySelector(".gateway-card")!;
+
+    expect(gateway).toHaveTextContent(`${location.origin}/v1`);
+    expect(gateway).toHaveTextContent("管理客户端 Key");
+    expect(gateway.querySelector("button[title='轮换 Key']")).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input) === "/api/settings/client-key/rotate")).toBe(false);
   });
 
   it("从模型状态控件更新模型策略", async () => {

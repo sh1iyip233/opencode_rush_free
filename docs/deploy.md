@@ -265,6 +265,46 @@ docker compose up -d          # 或者 systemctl restart relaydesk
 
 不改的话：浏览器会拒绝保存登录 Cookie，表现为「登录成功但立刻又跳回登录页」。
 
+### 4.4 让外部 AI 读日志（可选）
+
+日志接口默认跟着主端口走（`/api/logs...`），所以上面这份 nginx 配置已经能让外部访问了。
+如果你不想把整个面板暴露到公网、只想暴露日志面，就单独开一个监听：
+
+```bash
+# .env（或 /etc/relaydesk.env）
+LOG_API_ADDR=127.0.0.1:8099      # 只在本机监听，由 nginx 转发
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name logs.你的域名;
+
+    location / {
+        proxy_pass http://127.0.0.1:8099;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # /api/logs/stream 是 SSE，必须关缓冲
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+这个监听**只**提供 `/api/logs*`，其余路径一律 404，所以不怕它把面板 API 顺带暴露出去。
+鉴权密钥就是面板登录密码；把它交给 AI 时用 `X-Relay-Log-Key` 头，别写进 URL。
+
+```bash
+curl -s -H "X-Relay-Log-Key: $ADMIN_PASSWORD" https://logs.你的域名/api/logs/diagnostics
+```
+
+> 建议在 nginx 上再加 `limit_req` 限速，日志接口的失败计数只封 15 分钟，挡不住持续试探。
+
 ---
 
 ## 5. 第一次打开后台，按这个顺序做

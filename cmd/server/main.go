@@ -59,6 +59,12 @@ type App struct {
 	usageInsertStmt         *sql.Stmt
 	laneSessions            *laneSessionMemo
 	laneSessionsOnce        sync.Once
+	logs                    *logSink
+	logsOnce                sync.Once
+	logAuthMu               sync.Mutex
+	logAuthFails            map[string]loginAttempt
+	logKeyMu                sync.Mutex
+	logKeyCache             map[string]time.Time
 }
 
 type loginAttempt struct {
@@ -278,6 +284,7 @@ func main() {
 		log.Fatal(err)
 	}
 	app.initializeRuntimeServices()
+	app.startLogging()
 	app.deleteExpiredProxies()
 	if err := app.deleteExpiredUsage(); err != nil {
 		log.Fatal(err)
@@ -289,7 +296,11 @@ func main() {
 	go app.alertEvaluationJanitor()
 	mux := http.NewServeMux()
 	app.routes(mux)
+	if logAddr := strings.TrimSpace(os.Getenv("LOG_API_ADDR")); logAddr != "" {
+		app.serveLogAPI(logAddr)
+	}
 	server := &http.Server{Addr: ":" + port, Handler: app.withMiddleware(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: upstreamRequestTimeout, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
+	app.logEvent(logEvent{Level: logLevelInfo, Source: logSourceSystem, Event: "service.listen", Message: fmt.Sprintf("listening on :%s", port), Detail: map[string]any{"addr": ":" + port, "web_dir": getenv("WEB_DIR", "./web/dist")}})
 	log.Printf("opencode proxy pool listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
 }
@@ -380,6 +391,8 @@ CREATE TABLE IF NOT EXISTS proxy_probe_results (job_id TEXT NOT NULL, proxy_id I
 CREATE TABLE IF NOT EXISTS proxy_model_bans (proxy_id INTEGER NOT NULL, model_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'suspect', consecutive_failures INTEGER NOT NULL DEFAULT 0, banned_until TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(proxy_id,model_id));
 CREATE TABLE IF NOT EXISTS compression_sessions (session_key TEXT PRIMARY KEY, model TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', folded_digest TEXT NOT NULL DEFAULT '', folded_messages INTEGER NOT NULL DEFAULT 0, folded_tokens INTEGER NOT NULL DEFAULT 0, compressions INTEGER NOT NULL DEFAULT 0, tokens_before INTEGER NOT NULL DEFAULT 0, tokens_after INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS compression_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, session_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', api_style TEXT NOT NULL DEFAULT '', summary_model TEXT NOT NULL DEFAULT '', folded_messages INTEGER NOT NULL DEFAULT 0, tokens_before INTEGER NOT NULL DEFAULT 0, tokens_after INTEGER NOT NULL DEFAULT 0, summary_tokens INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'success', error_message TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS log_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, created_at TEXT NOT NULL, level TEXT NOT NULL, source TEXT NOT NULL, event TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', status INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, client_ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT '', client_key_id INTEGER, message TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS log_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, author TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'note', severity TEXT NOT NULL DEFAULT 'info', title TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', event_id INTEGER, tags TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model);`)
 	if err != nil {
 		return err
@@ -431,6 +444,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"CREATE INDEX IF NOT EXISTS idx_proxy_model_bans_until ON proxy_model_bans(banned_until)",
 		"CREATE INDEX IF NOT EXISTS idx_compression_sessions_updated ON compression_sessions(updated_at)",
 		"CREATE INDEX IF NOT EXISTS idx_compression_events_created ON compression_events(created_at)",
+		"CREATE INDEX IF NOT EXISTS idx_log_events_ts ON log_events(ts)",
+		"CREATE INDEX IF NOT EXISTS idx_log_events_level_ts ON log_events(level,ts)",
+		"CREATE INDEX IF NOT EXISTS idx_log_events_source_ts ON log_events(source,ts)",
+		"CREATE INDEX IF NOT EXISTS idx_log_events_request ON log_events(request_id)",
+		"CREATE INDEX IF NOT EXISTS idx_log_events_path_ts ON log_events(path,ts)",
+		"CREATE INDEX IF NOT EXISTS idx_log_events_event_ts ON log_events(event,ts)",
+		"CREATE INDEX IF NOT EXISTS idx_log_notes_created ON log_notes(created_at)",
 	} {
 		if _, indexErr := db.Exec(statement); indexErr != nil {
 			return indexErr
@@ -736,11 +756,19 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/compression/sessions/reset", a.requireAdmin(a.resetCompressionSessions))
 	mux.HandleFunc("DELETE /api/compression/sessions/{key}", a.requireAdmin(a.deleteCompressionSession))
 	mux.HandleFunc("POST /api/compression/preview", a.requireAdmin(a.previewCompression))
+	a.logRoutes(mux)
 	webDir := getenv("WEB_DIR", "./web/dist")
 	mux.HandleFunc("/", serveSPA(webDir))
 }
 
+// withMiddleware composes the outer layers in the order that keeps the log
+// complete: the request is traced first, a panic is turned into a logged 500
+// next, and the security headers apply to whatever finally answers.
 func (a *App) withMiddleware(next http.Handler) http.Handler {
+	return a.requestLog(a.recoverPanic(a.securityHeaders(next)))
+}
+
+func (a *App) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -1741,10 +1769,16 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	clientKey, authErr := a.authenticateClient(r)
 	if authErr != nil {
+		traceSet(r, "stage", "client_auth")
+		traceSet(r, "error", clientKeyError(authErr))
 		writeJSON(w, 401, map[string]string{"error": clientKeyError(authErr)})
 		return
 	}
+	traceSet(r, "client_key_id", clientKey.ID)
+	traceSet(r, "client_key_name", clientKey.Name)
 	if !a.enforceClientLimit(w, clientKey) {
+		traceSet(r, "stage", "client_limit")
+		traceSet(r, "error", "client key rate or token limit reached")
 		return
 	}
 	a.touchClientKey(clientKey)
@@ -1752,6 +1786,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	case a.gatewaySem <- struct{}{}:
 		defer func() { <-a.gatewaySem }()
 	default:
+		traceSet(r, "stage", "gateway_capacity")
+		traceSet(r, "error", "gateway is at capacity")
 		w.Header().Set("Retry-After", "1")
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "gateway is at capacity"})
 		return
@@ -1763,6 +1799,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	}
 	parsed, requestPayload, parseErr := parseChatEnvelope(body)
 	if parseErr != nil || parsed.Model == "" {
+		traceSet(r, "stage", "parse")
+		traceSet(r, "error", "model is required")
 		writeJSON(w, 400, map[string]string{"error": "model is required"})
 		return
 	}
@@ -1775,9 +1813,15 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(resolveErr.Error(), "not an available") && !strings.Contains(resolveErr.Error(), "not currently") {
 			status = http.StatusInternalServerError
 		}
+		traceSet(r, "stage", "resolve_model")
+		traceSet(r, "model", requestedModel)
+		traceSet(r, "error", resolveErr.Error())
 		writeJSON(w, status, map[string]string{"error": resolveErr.Error()})
 		return
 	}
+	traceSet(r, "model", requestedModel)
+	traceSet(r, "resolved_model", resolvedModel)
+	traceSet(r, "stream", parsed.Stream)
 	forwardBody := body
 	if resolvedModel != requestedModel {
 		requestPayload["model"] = resolvedModel
@@ -1815,10 +1859,13 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	}
 	engineConfig, err := a.loadProxyEngine()
 	if err != nil {
+		traceSet(r, "stage", "proxy_engine")
+		traceSet(r, "error", "could not load proxy engine")
 		writeJSON(w, 500, map[string]string{"error": "could not load proxy engine"})
 		return
 	}
 	routeEngine := engineConfig.Engine
+	traceSet(r, "route_engine", routeEngine)
 	resinMode := routeEngine == proxyEngineResin
 	proxies := []ProxyRecord{}
 	if resinMode {
@@ -1839,10 +1886,13 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(proxies) == 0 {
 			a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusServiceUnavailable, time.Since(start), nil, 0, nil, nil, clientUserAgent, parsed.Stream, errors.New("no healthy proxies available"), "internal")
+			traceSet(r, "stage", "proxy_pool")
+			traceSet(r, "error", "no healthy proxies available")
 			writeJSON(w, 503, map[string]string{"error": "no healthy proxies available"})
 			return
 		}
 	}
+	traceSet(r, "proxy_count", len(proxies))
 	requestSessionKey := sessionKey(r, parsed.User, parsed.Messages)
 	// The upstream session id is a separate identity from the rotation affinity:
 	// it must always exist (the free lane rejects a request without a canonical
@@ -1862,6 +1912,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	setCompressionHeaders(w, compression)
+	traceSet(r, "compression_applied", compression.Applied)
+	traceSet(r, "compression_blocking", compression.Blocking)
 	// The lane rejects a non-streaming request, so the upstream always sees
 	// stream:true. A client that asked for one JSON object gets one folded back
 	// out of the stream below, so the requirement never reaches the client.
@@ -1925,6 +1977,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		retryCount = i
 		lastProxyURI = p.URI
+		traceNote(r, "attempt %d/%d engine=%s proxy=%s", i+1, attempts, routeEngine, redactProxyURI(p.URI))
 		bodyToForward := forwardBody
 		if visionEnabled {
 			helperStarted := time.Now()
@@ -2038,6 +2091,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		resp, e := a.forward(r, bodyToForward, cfg, p, laneSession)
 		if e != nil {
 			lastErr = e
+			traceNote(r, "attempt %d transport error: %s", i+1, truncateError(e.Error()))
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
 			if requestErr := r.Context().Err(); requestErr != nil {
 				downstreamErr = requestErr
@@ -2081,6 +2135,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				a.clearSessionProxy(requestSessionKey, p.ID)
 			}
 		}
+		traceNote(r, "attempt %d upstream status %d verdict=%s", i+1, resp.StatusCode, upstreamOutcomeName(classifyUpstreamOutcome(resp.StatusCode)))
 		if resp.StatusCode == http.StatusProxyAuthRequired && !resinMode {
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "error": "proxy authentication failed", "latency_ms": time.Since(start).Milliseconds()})
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
@@ -2136,10 +2191,22 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
 		a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, clientUserAgent, parsed.Stream, requestError)
+		traceSet(r, "status_code", resp.StatusCode)
+		traceSet(r, "attempts", i+1)
+		if firstTokenLatency != nil {
+			traceSet(r, "first_token_ms", firstTokenLatency.Milliseconds())
+		}
+		if requestError != nil {
+			traceSet(r, "error", truncateError(requestError.Error()))
+		}
 		return
 	}
 	lastErr, finalStatus, origin := terminalGatewayFailure(downstreamErr, lastErr)
 	a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", finalStatus, time.Since(start), nil, retryCount, nil, attemptSummary, clientUserAgent, parsed.Stream, lastErr, origin)
+	traceSet(r, "stage", "all_proxies_failed")
+	traceSet(r, "attempts", retryCount+1)
+	traceSet(r, "error_origin", origin)
+	traceSet(r, "error", lastErrString(lastErr))
 	writeJSON(w, finalStatus, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
 }
 

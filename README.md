@@ -56,6 +56,7 @@ SESSION_SECRET=至少32个字符的随机密钥
 | `COOKIE_SECURE`           | `false`         | HTTPS 部署设为 `true` |
 | `MAX_CONCURRENT_REQUESTS` | `100`           | 网关并发上限            |
 | `DATABASE_PATH`           | `./data/app.db` | SQLite 路径         |
+| `LOG_API_ADDR`            | 空               | 日志接口的独立监听地址（如 `0.0.0.0:8099`），空表示跟随 `PORT` |
 
 不要提交 `.env`、数据库文件或任何明文凭证。`APP_ENCRYPTION_KEY` 更换前需要先完成密钥迁移。
 
@@ -99,6 +100,25 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"<enabled-model>","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+## 日志接口（给 AI / 脚本排障用）
+
+进程把每个请求、每次上游轮换、每次鉴权失败、每行 `log.Printf` 都写进 SQLite 的
+`log_events`，并通过 `/api/logs*` 暴露出来。**鉴权密钥就是面板登录密码**：
+
+```bash
+export RELAY=http://127.0.0.1:8080
+export KEY=$ADMIN_PASSWORD
+
+curl -s -H "X-Relay-Log-Key: $KEY" $RELAY/api/logs/diagnostics | jq '.summary, .checks[] | select(.status!="ok")'
+curl -s -H "X-Relay-Log-Key: $KEY" "$RELAY/api/logs?level=error&limit=20" | jq '.events[]'
+curl -N -H "X-Relay-Log-Key: $KEY" "$RELAY/api/logs/stream?level=error,warn&backlog=50"
+```
+
+`/api/logs/diagnostics` 会跑一组自检规则（5xx 率、延迟、panic、代理池、并发、库体积…）
+并给出 `healthy` / `degraded` / `broken` 结论；`request_id` 能把一次调用的全部尝试串起来；
+`/api/logs/notes` 是回写通道，改完代码可以把结论留在系统里。凭证在落库前统一脱敏。
+完整接口、查询参数与排障剧本见 [docs/logs.md](docs/logs.md)。
 
 ## 管理 API
 

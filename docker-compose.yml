@@ -25,12 +25,17 @@ services:
       # from .env as well, so a custom PORT must appear on both sides. Pinning
       # the container side to 8080 publishes a port nothing listens on.
       - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:${PORT:-8080}"
+      # Optional dedicated log listener. Set LOG_API_ADDR (and
+      # LOG_API_PORT to publish it) only when the log API should live on its
+      # own port; the same endpoints are always reachable on PORT above.
+      # - "${LOG_API_BIND:-127.0.0.1}:${LOG_API_PORT:-8099}:${LOG_API_PORT:-8099}"
     env_file:
       - .env
     environment:
       WEB_DIR: /app/web/dist
       DATABASE_PATH: /data/app.db
       PORT: "${PORT:-8080}"
+      LOG_API_ADDR: "${LOG_API_ADDR:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

@@ -30,7 +30,7 @@ openssl rand -hex 16   # → ADMIN_PASSWORD（这就是你的后台登录密码�
 
 | 变量 | 规矩 |
 | --- | --- |
-| `APP_ENCRYPTION_KEY` | 至少 32 字符。**丢了就完蛋**——库里存的上游 API Key、代理账号密码全是它加密的，丢了只能全部重新录一遍。请抄进密码管理器。 |
+| `APP_ENCRYPTION_KEY` | 至少 32 字符。**丢了就完蛋**——库里存的图片辅助模型 key、代理账号密码全是它加密的，丢了只能全部重新录一遍。请抄进密码管理器。 |
 | `SESSION_SECRET` | 至少 32 字符。换掉它 = 所有已登录会话立刻失效（不算灾难，但别随手改）。 |
 | `ADMIN_PASSWORD` | **只在第一次启动时用一次**，之后密码存在数据库里，改 env 不再生效。改密码走界面。不能填 `admin`，也不能带 `change-me` 之类的字样，否则程序拒绝启动。 |
 
@@ -273,11 +273,10 @@ docker compose up -d          # 或者 systemctl restart relaydesk
 
 **顺序别乱，每一步都依赖上一步：**
 
-1. **上游设置**（Settings → Upstream）
-   - `Base URL`：填到 `/v1` 之前那一层。比如上游是 `https://api.example.com/v1/chat/completions`，这里就填 `https://api.example.com/v1`。多写一层 `/v1` 会变成 `/v1/v1/...`，请求全 404。
-   - `API Key`：上游的 key。
-   - 有识图需求再填 Vision 那几项，没需求留空。
-   - 填完点「测试」，通了再往下。
+1. **上游通道**（模型与网关 → 上游通道）
+   - 上游地址和认证是**写死在程序里的**（OpenCode Zen 匿名免费通道），页面上只读展示，不用填、也不能改。
+   - 想确认服务器能连上游，点「测试上游连通性」，直连和走代理各测一次。
+   - 有识图需求再填「图片辅助模型」那三项（独立供应商，走自己的地址和 key），没需求留空。
 2. **代理池**（Proxies）
    - 添加或批量导入。**批量导入是一行一个完整 URI**，不是 `host:port:user:pass` 那种冒号串：
      ```
@@ -321,7 +320,7 @@ systemctl start relaydesk
 sqlite3 /var/lib/relaydesk/app.db ".backup '/root/backup/app-$(date +%F).db'"
 ```
 
-> 备份里包含加密后的上游 key 和代理密码。**`APP_ENCRYPTION_KEY` 要和备份一起保管**，只有 db 没有密钥，等于一堆乱码。
+> 备份里包含加密后的图片辅助模型 key 和代理密码。**`APP_ENCRYPTION_KEY` 要和备份一起保管**，只有 db 没有密钥，等于一堆乱码。
 
 ### 升级
 
@@ -358,7 +357,7 @@ docker compose logs --tail=100 opencode-proxy     # 或 journalctl -u relaydesk 
 | 浏览器连不上，`curl localhost:6320` 也不通 | 服务没起在 6320 上，或者防火墙挡了 | `ss -lntp \| grep 6320` 看有没有监听；`ufw status` 看规则 |
 | 登录成功又跳回登录页 | `COOKIE_SECURE=true` 但访问的是 http | 上 HTTPS，或者临时改回 `false` |
 | 请求返回 503 `no healthy proxies available` | 代理全在冷却/过期/停用 | 去代理页跑探测；刚冷却的出口 1~30 分钟会自动回池 |
-| 请求返回 502 `all proxies failed` | 上游 key 或 base_url 错，或者代理全挂 | 点「测试上游」；看详情里的 attempt 记录 |
+| 请求返回 502 `all proxies failed` | 代理全挂，或出口 IP 被上游限流 | 点「测试上游连通性」；看详情里的 attempt 记录 |
 | 流式回答像卡住 | nginx 没关 `proxy_buffering` | 第 4.2 节那三行补上 |
 | 上传图片 413 | nginx 请求体上限 | `client_max_body_size 32m;` |
 | 后台密码忘了 | 密码在库里，改 env 没用 | `sqlite3 app.db "DELETE FROM settings WHERE key='admin_hash';"` 然后重启，会用 env 里的 `ADMIN_PASSWORD` 重设 |
@@ -377,5 +376,5 @@ docker compose logs --tail=100 opencode-proxy     # 或 journalctl -u relaydesk 
 - [ ] nginx 里写了 `proxy_buffering off` 和 `client_max_body_size`
 - [ ] 上了 HTTPS 且 `COOKIE_SECURE=true`
 - [ ] 6320 端口没有直接暴露在公网
-- [ ] 后台里：上游测试通过 → 代理探测全绿 → 客户端 key 已创建并试过 `/v1/models`
+- [ ] 后台里：上游连通性测试通过 → 代理探测全绿 → 客户端 key 已创建并试过 `/v1/models`
 - [ ] 备份跑过一次，且知道 `APP_ENCRYPTION_KEY` 存在哪

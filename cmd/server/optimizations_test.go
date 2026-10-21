@@ -98,6 +98,7 @@ func TestModelRefreshPreservesPoliciesAndHidesStaleAliases(t *testing.T) {
 	if put.Code != http.StatusOK {
 		t.Fatalf("configure upstream failed: %d %s", put.Code, put.Body.String())
 	}
+	pointLaneAt(t, upstream.URL)
 	firstRefresh := httptest.NewRecorder()
 	a.refreshModels(firstRefresh, httptest.NewRequest(http.MethodPost, "/api/settings/models/refresh", nil))
 	if firstRefresh.Code != http.StatusOK {

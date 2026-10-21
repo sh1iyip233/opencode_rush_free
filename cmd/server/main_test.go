@@ -23,6 +23,16 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// pointLaneAt routes the fixed Zen lane at a test server. In production the
+// lane base is a compile-time constant; laneBaseOverride exists only so tests
+// can stand in for upstream.
+func pointLaneAt(t testing.TB, base string) {
+	t.Helper()
+	previous := laneBaseOverride
+	laneBaseOverride = base
+	t.Cleanup(func() { laneBaseOverride = previous })
+}
+
 func testApp(t testing.TB) *App {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:test-"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared")
@@ -251,6 +261,7 @@ func TestForceFreeModelOverridesPersistAcrossRefreshes(t *testing.T) {
 	defer upstream.Close()
 
 	put := httptest.NewRecorder()
+	pointLaneAt(t, upstream.URL)
 	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"`+upstream.URL+`"}`)))
 	if put.Code != http.StatusOK {
 		t.Fatalf("configure upstream failed: %d: %s", put.Code, put.Body.String())
@@ -657,6 +668,7 @@ func TestCanceledGatewayRequestIsExternalAndDoesNotPenalizeResin(t *testing.T) {
 	}()
 
 	upstream := httptest.NewRecorder()
+	pointLaneAt(t, "http://upstream.example.test")
 	a.putUpstream(upstream, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"http://upstream.example.test"}`)))
 	if upstream.Code != http.StatusOK {
 		t.Fatalf("configure upstream failed: %d %s", upstream.Code, upstream.Body.String())
@@ -900,7 +912,7 @@ func TestUsageRatesUseRollingSixtySecondWindow(t *testing.T) {
 	}
 }
 
-func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
+func TestLaneHeadersReachModelsAndChat(t *testing.T) {
 	a := testApp(t)
 	var modelHeaders, chatHeaders http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -918,19 +930,11 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
+	pointLaneAt(t, upstream.URL)
 
-	payload, _ := json.Marshal(map[string]any{
-		"base_url":        upstream.URL,
-		"api_key":         "up-secret",
-		"vision_base_url": upstream.URL,
-		"vision_api_key":  "vision-secret",
-		"vision_model":    "vision-model",
-		"custom_headers": map[string]string{
-			"User-Agent":        "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
-			"x-opencode-client": "cli",
-			"X-Relay-Test":      "enabled",
-		},
-	})
+	// Only the vision supplier is configurable. base_url, api_key and
+	// custom_headers are accepted in the body but must not steer the lane.
+	payload := []byte(`{"base_url":"http://ignored.example.test","api_key":"up-secret","custom_headers":{"X-Relay-Test":"enabled"},"vision_base_url":"` + upstream.URL + `","vision_api_key":"vision-secret","vision_model":"vision-model"}`)
 	put := httptest.NewRecorder()
 	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", bytes.NewReader(payload)))
 	if put.Code != http.StatusOK {
@@ -942,31 +946,63 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	if refresh.Code != http.StatusOK {
 		t.Fatalf("model refresh failed: %d body=%s", refresh.Code, refresh.Body.String())
 	}
-	if modelHeaders.Get("User-Agent") != "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13" || modelHeaders.Get("X-Opencode-Client") != "cli" || modelHeaders.Get("X-Relay-Test") != "enabled" {
-		t.Fatalf("custom model headers were not forwarded: %#v", modelHeaders)
-	}
-	if modelHeaders.Get("Authorization") != "Bearer up-secret" {
-		t.Fatalf("upstream authorization was not injected: %#v", modelHeaders)
-	}
+	assertLaneHeaders(t, "models", modelHeaders)
 
 	cfg, err := a.loadUpstream()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cfg.BaseURL != upstream.URL || cfg.APIKey != zenAnonymousKey {
+		t.Fatalf("upstream lane followed the request body: %#v", cfg)
+	}
 	if cfg.VisionBaseURL != upstream.URL || cfg.VisionAPIKey != "vision-secret" || cfg.VisionModel != "vision-model" {
 		t.Fatalf("vision supplier configuration was not isolated: %#v", cfg)
 	}
-	resp, err := a.forward(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL})
+
+	session := canonicalSessionID("lane-test", time.Now())
+	resp, err := a.forward(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL}, session)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	if chatHeaders.Get("User-Agent") != "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13" || chatHeaders.Get("X-Opencode-Client") != "cli" || chatHeaders.Get("X-Relay-Test") != "enabled" {
-		t.Fatalf("custom chat headers were not forwarded: %#v", chatHeaders)
+	assertLaneHeaders(t, "chat", chatHeaders)
+	for _, name := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"} {
+		if got := chatHeaders.Get(name); got != session {
+			t.Fatalf("affinity header %q = %q, want %q", name, got, session)
+		}
 	}
-	if chatHeaders.Get("Authorization") != "Bearer up-secret" || chatHeaders.Get("Content-Type") != "application/json" {
-		t.Fatalf("gateway-managed headers were not injected: %#v", chatHeaders)
+	if chatHeaders.Get("x-opencode-project") != openCodeProjectID {
+		t.Fatalf("project header = %q", chatHeaders.Get("x-opencode-project"))
+	}
+}
+
+// assertLaneHeaders checks the CLI disguise every upstream request must carry.
+// x-opencode-request is deliberately absent: upstream refuses any value.
+func assertLaneHeaders(t *testing.T, label string, headers http.Header) {
+	t.Helper()
+	if headers == nil {
+		t.Fatalf("%s request never reached the upstream", label)
+	}
+	if got := headers.Get("Authorization"); got != "Bearer "+zenAnonymousKey {
+		t.Fatalf("%s authorization = %q", label, got)
+	}
+	if got := headers.Get("x-opencode-client"); got != "cli" {
+		t.Fatalf("%s client header = %q", label, got)
+	}
+	if got := headers.Get("Accept"); got != "application/json, text/event-stream" {
+		t.Fatalf("%s accept = %q", label, got)
+	}
+	if got := headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("%s content type = %q", label, got)
+	}
+	if got := headers.Get("User-Agent"); got != openCodeUserAgent() {
+		t.Fatalf("%s user agent = %q", label, got)
+	}
+	for _, banned := range []string{"x-opencode-request", "X-Relay-Test"} {
+		if got := headers.Get(banned); got != "" {
+			t.Fatalf("%s sent %q = %q", label, banned, got)
+		}
 	}
 }
 
@@ -1041,6 +1077,7 @@ func TestVisionDirectRequestDoesNotPenalizeChatProxy(t *testing.T) {
 
 	payload := []byte(`{"base_url":"http://gateway-upstream.example.test","vision_base_url":"` + vision.URL + `","vision_model":"vision-model","vision_use_proxy":false}`)
 	put := httptest.NewRecorder()
+	pointLaneAt(t, "http://gateway-upstream.example.test")
 	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", bytes.NewReader(payload)))
 	if put.Code != http.StatusOK {
 		t.Fatalf("upstream config failed: %d body=%s", put.Code, put.Body.String())
@@ -1083,18 +1120,6 @@ func TestVisionDirectRequestDoesNotPenalizeChatProxy(t *testing.T) {
 	}
 	if helperProxyID.Valid || helperProxyURI != "" || helperStatus != "error" {
 		t.Fatalf("direct helper usage was not recorded as direct: id=%#v uri=%q status=%q", helperProxyID, helperProxyURI, helperStatus)
-	}
-}
-
-func TestCustomHeaderValidation(t *testing.T) {
-	if _, err := validateCustomHeaders(map[string]string{"Authorization": "Bearer override"}); err == nil {
-		t.Fatal("authorization override was accepted")
-	}
-	if _, err := validateCustomHeaders(map[string]string{"X-Test\r\nInjected": "value"}); err == nil {
-		t.Fatal("invalid header name was accepted")
-	}
-	if _, err := validateCustomHeaders(map[string]string{"X-Test": "line1\r\nline2"}); err == nil {
-		t.Fatal("invalid header value was accepted")
 	}
 }
 
@@ -1260,6 +1285,7 @@ func TestAdminImportRefreshAndGatewayModels(t *testing.T) {
 		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
 	}))
 	defer upstream.Close()
+	pointLaneAt(t, upstream.URL)
 	put := request(http.MethodPut, "/api/settings/upstream", `{"base_url":"`+upstream.URL+`","api_key":"up-secret"}`)
 	if put.StatusCode != 200 {
 		t.Fatalf("upstream config failed: %d", put.StatusCode)
@@ -1348,6 +1374,7 @@ func TestGatewayRoutesBypassSPAFallback(t *testing.T) {
 	defer proxyServer.Close()
 
 	upstream := httptest.NewRecorder()
+	pointLaneAt(t, "http://upstream.example.test")
 	a.putUpstream(upstream, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"http://upstream.example.test"}`)))
 	if upstream.Code != http.StatusOK {
 		t.Fatalf("configure upstream failed: %d: %s", upstream.Code, upstream.Body.String())
@@ -2319,6 +2346,7 @@ func TestRecoverResinClearsPersistedFallback(t *testing.T) {
 	defer proxyServer.Close()
 	upstreamPayload := `{"base_url":"http://upstream.example.test","api_key":"upstream-token"}`
 	upstreamRecorder := httptest.NewRecorder()
+	pointLaneAt(t, "http://upstream.example.test")
 	a.putUpstream(upstreamRecorder, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(upstreamPayload)))
 	if upstreamRecorder.Code != http.StatusOK {
 		t.Fatalf("save upstream failed: %d %s", upstreamRecorder.Code, upstreamRecorder.Body.String())

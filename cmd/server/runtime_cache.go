@@ -51,27 +51,25 @@ type modelRuntimeCache struct {
 	aliases map[string]string
 }
 
+// compressionRuntimeCache holds the compression gateway settings. The cached
+// value already carries the decrypted API key, so it is never logged.
+type compressionRuntimeCache struct {
+	mu     sync.RWMutex
+	loaded bool
+	cfg    compressionConfig
+}
+
 type runtimeCaches struct {
 	upstream    upstreamRuntimeCache
 	engine      engineRuntimeCache
 	maintenance maintenanceRuntimeCache
 	keys        clientKeyRuntimeCache
 	models      modelRuntimeCache
+	compression compressionRuntimeCache
 
 	routingMu     sync.RWMutex
 	routingLimit  int
 	routingLoaded bool
-}
-
-func cloneHeaders(headers map[string]string) map[string]string {
-	if len(headers) == 0 {
-		return nil
-	}
-	copyHeaders := make(map[string]string, len(headers))
-	for name, value := range headers {
-		copyHeaders[name] = value
-	}
-	return copyHeaders
 }
 
 func cloneTime(value *time.Time) *time.Time {
@@ -83,7 +81,6 @@ func cloneTime(value *time.Time) *time.Time {
 }
 
 func cloneUpstreamConfig(cfg upstreamConfig) upstreamConfig {
-	cfg.CustomHeaders = cloneHeaders(cfg.CustomHeaders)
 	cfg.LastRefresh = cloneTime(cfg.LastRefresh)
 	return cfg
 }
@@ -128,6 +125,13 @@ func (a *App) invalidateModelRuntimeCache() {
 	a.runtimeCaches.models.models = nil
 	a.runtimeCaches.models.aliases = nil
 	a.runtimeCaches.models.mu.Unlock()
+}
+
+func (a *App) invalidateCompressionCache() {
+	a.runtimeCaches.compression.mu.Lock()
+	a.runtimeCaches.compression.loaded = false
+	a.runtimeCaches.compression.cfg = compressionConfig{}
+	a.runtimeCaches.compression.mu.Unlock()
 }
 
 func (a *App) cachedRoutingLimit() int {

@@ -285,26 +285,6 @@ const publicApi = async (path: string, init: RequestInit = {}) => {
 const fmt = (n: number) => new Intl.NumberFormat("zh-CN").format(n || 0);
 const freeReasonText = (reason: string) =>
   reason === "manual_override" ? "手动指定" : reason.replaceAll("_", " ");
-const headersToText = (headers?: Record<string, string>) =>
-  Object.entries(headers || {})
-    .map(([name, value]) => `${name}: ${value}`)
-    .join("\n");
-const parseHeaderText = (text: string) => {
-  const headers: Record<string, string> = {};
-  for (const [index, raw] of text.split(/\r?\n/).entries()) {
-    const line = raw.trim();
-    if (!line) continue;
-    const separator = line.indexOf(":");
-    if (separator < 1)
-      throw new Error(`第 ${index + 1} 行必须使用 Header-Name: value 格式`);
-    const name = line.slice(0, separator).trim();
-    const value = line.slice(separator + 1).trim();
-    if (!name) throw new Error(`第 ${index + 1} 行缺少请求头名称`);
-    headers[name] = value;
-  }
-  return headers;
-};
-
 function Login({ onLogin }: { onLogin: () => void }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -2053,29 +2033,20 @@ function Models({
   notify: (v: string, type?: ToastType) => void;
   registerRefresh?: RegisterRefresh;
 }) {
-  const [base, setBase] = useState(upstream.base_url || "");
-  const [key, setKey] = useState("");
   const [visionBase, setVisionBase] = useState(upstream.vision_base_url || "");
   const [visionKey, setVisionKey] = useState("");
   const [visionModel, setVisionModel] = useState(upstream.vision_model || "");
   const [visionUseProxy, setVisionUseProxy] = useState(
     upstream.vision_use_proxy !== false,
   );
-  const [headers, setHeaders] = useState(() =>
-    headersToText(upstream.custom_headers),
-  );
   const [busy, setBusy] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
   const childRefreshers = useRef(new Set<RefreshHandler>());
   useEffect(() => {
-    setBase(upstream.base_url || "");
     setVisionBase(upstream.vision_base_url || "");
     setVisionModel(upstream.vision_model || "");
     setVisionUseProxy(upstream.vision_use_proxy !== false);
-    setHeaders(headersToText(upstream.custom_headers));
   }, [
-    upstream.base_url,
-    upstream.custom_headers,
     upstream.vision_base_url,
     upstream.vision_model,
     upstream.vision_use_proxy,
@@ -2093,29 +2064,18 @@ function Models({
   }, [reload]);
   useEffect(() => registerRefresh("models", refreshSavedData), [refreshSavedData, registerRefresh]);
   const save = async () => {
-    let customHeaders: Record<string, string>;
-    try {
-      customHeaders = parseHeaderText(headers);
-    } catch (e) {
-      notify((e as Error).message, "error");
-      return;
-    }
     setBusy(true);
     try {
       await api("/api/settings/upstream", {
         method: "PUT",
         body: JSON.stringify({
-          base_url: base,
-          api_key: key,
           vision_base_url: visionBase,
           vision_api_key: visionKey,
           vision_model: visionModel,
           vision_use_proxy: visionUseProxy,
-          custom_headers: customHeaders,
         }),
       });
-      notify("上游配置已保存");
-      setKey("");
+      notify("辅助模型配置已保存");
       setVisionKey("");
       reload();
     } catch (e) {
@@ -2179,58 +2139,44 @@ function Models({
         <div className="panel">
           <div className="panel-head">
             <div>
-              <h3>上游端点</h3>
-              <p className="muted">凭证只在服务器侧使用</p>
+              <h3>上游通道</h3>
+              <p className="muted">固定为 OpenCode Zen 匿名免费通道</p>
             </div>
             <Server size={20} />
           </div>
-          <label>
-            Base URL
-            <input
-              value={base}
-              onChange={(e) => setBase(e.target.value)}
-              placeholder="https://api.example.com"
-            />
-          </label>
-          <label>
-            API Key
-            <input
-              type="password"
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              placeholder={
-                upstream.has_api_key
-                  ? "已保存 · 留空保持不变"
-                  : "输入上游 OpenCode / Zen Key"
-              }
-            />
-            <small className="field-help">
-              这里填写上游 OpenCode / Zen API Key，不是下面的网关 Key。粘贴带
-              Bearer 前缀的值也会自动处理。
-            </small>
-          </label>
-          <label>
-            自定义请求头
-            <textarea
-              className="headers-input"
-              value={headers}
-              onChange={(e) => setHeaders(e.target.value)}
-              spellCheck={false}
-              placeholder={
-                "User-Agent: opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13\nx-opencode-client: cli"
-              }
-            />
-          </label>
+          <div className="lane-facts">
+            <div>
+              <span>通道</span>
+              <code>{upstream.upstream_lane || "zen-anonymous"}</code>
+            </div>
+            <div>
+              <span>聊天端点</span>
+              <code>
+                {upstream.upstream_endpoint ||
+                  "https://opencode.ai/zen/v1/chat/completions"}
+              </code>
+            </div>
+            <div>
+              <span>模型目录</span>
+              <code>
+                {upstream.upstream_models_endpoint ||
+                  "https://opencode.ai/zen/v1/models"}
+              </code>
+            </div>
+            <div>
+              <span>认证</span>
+              <code>{upstream.upstream_authorization || "Bearer public"}</code>
+            </div>
+          </div>
           <p className="muted header-note">
-            每行一个 <code>Header-Name: value</code>
-            。模型刷新和聊天请求都会使用这些值。
+            地址与认证写死在程序里，不需要也不能填写。请求按 OpenCode CLI
+            的形态发出（含固定 User-Agent、<code>x-opencode-client: cli</code>
+            和每段会话固定的 <code>ses_</code> 会话号），免费额度按会话与出口 IP
+            计算，因此会话号会在整段对话中保持不变。
           </p>
           <div className="config-actions">
-            <button className="secondary" onClick={save} disabled={busy}>
-              保存配置
-            </button>
             <button className="secondary" onClick={testKey} disabled={busy}>
-              测试上游 Key
+              测试上游连通性
             </button>
           </div>
           {testResult && (
@@ -2265,7 +2211,7 @@ function Models({
             </button>
           </div>
           <p className="muted small">
-            将此地址和下方创建的 Client Key 填入 OpenCode。上游 OpenCode / Zen API Key 仅用于服务器向上游认证，不是客户端 Key。
+            将此地址和下方创建的 Client Key 填入 OpenCode。上游由服务器内置，客户端只需要这对地址和 Key。
           </p>
           <button className="text-btn gateway-key-link" type="button" onClick={() => document.getElementById("client-keys")?.scrollIntoView({ behavior: "smooth", block: "start" })}>
             管理客户端 Key
@@ -2331,9 +2277,14 @@ function Models({
           </span>
         </label>
         <p className="muted vision-helper-note">
-          三项同时填写后启用。辅助请求不会使用 OpenCode 上游
-          Key，也不会把图片内容写入使用记录；请点击上方“保存配置”生效。
+          三项同时填写后启用。辅助请求走这里填写的独立供应商，不会使用 Zen
+          通道，也不会把图片内容写入使用记录。
         </p>
+        <div className="config-actions">
+          <button className="secondary" onClick={save} disabled={busy}>
+            保存配置
+          </button>
+        </div>
       </section>
       <section className="panel">
         <div className="panel-head">

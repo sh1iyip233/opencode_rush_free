@@ -62,7 +62,7 @@ SESSION_SECRET=至少32个字符的随机密钥
 ## 首次配置
 
 1. 使用 `ADMIN_PASSWORD` 登录管理台。
-2. 配置上游 Base URL 和 API Key。
+2. 上游是内置的 OpenCode Zen 匿名免费通道，地址与认证写死在程序里，无需配置；只需确认「测试上游连通性」能通。
 3. 添加代理，或选择 Resin 路由。
 4. 刷新模型，按需启停模型或创建别名。
 5. 在“模型与网关”页复制客户端 Base URL；在“客户端 Key”区域创建 Client Key，并将两者配置到 OpenCode：

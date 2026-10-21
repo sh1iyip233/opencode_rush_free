@@ -571,7 +571,7 @@ func (a *App) resinProbe(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return result, err
 	}
-	applyUpstreamHeaders(req, upstream)
+	applyLaneHeaders(req, a.catalogSession())
 	client, err := a.httpClient(p)
 	if err != nil {
 		return result, err

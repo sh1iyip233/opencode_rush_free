@@ -622,7 +622,7 @@ func (a *App) probeProxy(parent context.Context, proxy ProxyRecord, mode string)
 		} else {
 			ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstreamEndpoint(cfg.BaseURL, "/models"), nil)
-			applyUpstreamHeaders(req, cfg)
+			applyLaneHeaders(req, a.catalogSession())
 			client, clientErr := a.httpClient(proxy)
 			if clientErr != nil {
 				err = clientErr

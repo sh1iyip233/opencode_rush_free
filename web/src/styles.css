@@ -941,6 +941,29 @@ textarea {
   font: 10px var(--data-font);
 }
 
+.lane-facts {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 13px;
+}
+
+.lane-facts > div {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 10px;
+}
+
+.lane-facts span {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.lane-facts code {
+  overflow-wrap: anywhere;
+  font: 11px var(--data-font);
+}
+
 .header-note {
   margin: -8px 0 13px;
 }

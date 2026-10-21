@@ -57,6 +57,8 @@ type App struct {
 	runtimeInitOnce         sync.Once
 	runtimeCaches           runtimeCaches
 	usageInsertStmt         *sql.Stmt
+	laneSessions            *laneSessionMemo
+	laneSessionsOnce        sync.Once
 }
 
 type loginAttempt struct {
@@ -115,13 +117,14 @@ type ModelRecord struct {
 }
 
 type upstreamConfig struct {
+	// BaseURL and APIKey are the fixed Zen lane (upstream_lane.go), carried in
+	// the struct so request construction reads them from one place.
 	BaseURL        string
 	APIKey         string
 	VisionBaseURL  string
 	VisionAPIKey   string
 	VisionModel    string
 	VisionUseProxy bool
-	CustomHeaders  map[string]string
 	UpdatedAt      time.Time
 	LastRefresh    *time.Time
 	LastError      string
@@ -182,26 +185,6 @@ func parseChatEnvelope(body []byte) (chatEnvelope, map[string]any, error) {
 	return chatEnvelope{Model: model, User: user, Messages: messages, Stream: stream}, payload, nil
 }
 
-var defaultUpstreamHeaders = map[string]string{
-	"User-Agent":        "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
-	"X-Opencode-Client": "cli",
-}
-
-var protectedUpstreamHeaders = map[string]struct{}{
-	"authorization":       {},
-	"connection":          {},
-	"content-length":      {},
-	"content-type":        {},
-	"host":                {},
-	"keep-alive":          {},
-	"proxy-authorization": {},
-	"proxy-connection":    {},
-	"te":                  {},
-	"trailer":             {},
-	"transfer-encoding":   {},
-	"upgrade":             {},
-}
-
 var blockedDownstreamHeaders = map[string]struct{}{
 	"connection":          {},
 	"content-length":      {},
@@ -246,17 +229,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer usageInsertStmt.Close()
-	appKey := []byte(os.Getenv("APP_ENCRYPTION_KEY"))
-	if len(appKey) < 32 {
-		log.Fatal("APP_ENCRYPTION_KEY must contain at least 32 characters")
-	}
+	appKey := []byte(requireSecret("APP_ENCRYPTION_KEY", os.Getenv("APP_ENCRYPTION_KEY")))
 	if looksLikePlaceholderSecret(string(appKey)) {
 		log.Print("SECURITY WARNING: APP_ENCRYPTION_KEY appears to be a placeholder; migrate encrypted credentials to a random key")
 	}
-	sessionSecret := os.Getenv("SESSION_SECRET")
-	if len(sessionSecret) < 32 {
-		log.Fatal("SESSION_SECRET must contain at least 32 characters")
-	}
+	sessionSecret := requireSecret("SESSION_SECRET", os.Getenv("SESSION_SECRET"))
 	if looksLikePlaceholderSecret(sessionSecret) {
 		log.Print("SECURITY WARNING: SESSION_SECRET appears to be a placeholder and should be replaced")
 	}
@@ -283,9 +260,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if previousSecret := os.Getenv("APP_ENCRYPTION_KEY_PREVIOUS"); previousSecret != "" {
-		if len(previousSecret) < 32 {
-			log.Fatal("APP_ENCRYPTION_KEY_PREVIOUS must contain at least 32 characters")
-		}
+		requireSecret("APP_ENCRYPTION_KEY_PREVIOUS", previousSecret)
 		previousHash := sha256.Sum256([]byte(previousSecret))
 		migrated, err := app.rotateEncryptionKey(previousHash[:])
 		if err != nil {
@@ -317,6 +292,33 @@ func main() {
 	server := &http.Server{Addr: ":" + port, Handler: app.withMiddleware(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: upstreamRequestTimeout, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	log.Printf("opencode proxy pool listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
+}
+
+// requireSecret returns a configured secret, refusing to start on a value too
+// short to be a real key. The message names the variable and its observed
+// length, never the value, and explains the usual cause.
+func requireSecret(name, value string) string {
+	if len(value) >= 32 {
+		return value
+	}
+	log.Fatalf("%s must contain at least 32 characters (got %d)%s", name, len(value), secretShapeHint(value))
+	return ""
+}
+
+// secretShapeHint explains a rejected secret from its shape alone. An empty
+// value almost always means the variable never reached the process; a trailing
+// carriage return means the file was saved with Windows line endings.
+func secretShapeHint(value string) string {
+	switch {
+	case value == "":
+		return "; the variable is empty or was not passed to the process: check that .env sits next to docker-compose.yml, that the name is spelled exactly, and recreate the container after editing it"
+	case strings.ContainsRune(value, '\r'):
+		return "; the value ends with a carriage return: the file was saved with Windows line endings, convert it to LF"
+	case strings.TrimSpace(value) != value:
+		return "; the value has surrounding whitespace: drop the quotes and any spaces around the = sign"
+	default:
+		return "; generate one with `openssl rand -hex 32`"
+	}
 }
 
 func getenv(k, fallback string) string {
@@ -376,6 +378,8 @@ CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, d
 CREATE TABLE IF NOT EXISTS proxy_probe_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, mode TEXT NOT NULL, total INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proxy_probe_results (job_id TEXT NOT NULL, proxy_id INTEGER NOT NULL, uri TEXT NOT NULL, exit_ok INTEGER NOT NULL DEFAULT 0, exit_ip TEXT, exit_latency_ms INTEGER, upstream_status TEXT, error TEXT, verdict TEXT, PRIMARY KEY(job_id,proxy_id), FOREIGN KEY(job_id) REFERENCES proxy_probe_jobs(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS proxy_model_bans (proxy_id INTEGER NOT NULL, model_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'suspect', consecutive_failures INTEGER NOT NULL DEFAULT 0, banned_until TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(proxy_id,model_id));
+CREATE TABLE IF NOT EXISTS compression_sessions (session_key TEXT PRIMARY KEY, model TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', folded_digest TEXT NOT NULL DEFAULT '', folded_messages INTEGER NOT NULL DEFAULT 0, folded_tokens INTEGER NOT NULL DEFAULT 0, compressions INTEGER NOT NULL DEFAULT 0, tokens_before INTEGER NOT NULL DEFAULT 0, tokens_after INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS compression_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, session_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', api_style TEXT NOT NULL DEFAULT '', summary_model TEXT NOT NULL DEFAULT '', folded_messages INTEGER NOT NULL DEFAULT 0, tokens_before INTEGER NOT NULL DEFAULT 0, tokens_after INTEGER NOT NULL DEFAULT 0, summary_tokens INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'success', error_message TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model);`)
 	if err != nil {
 		return err
@@ -425,6 +429,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"CREATE INDEX IF NOT EXISTS idx_alert_events_due ON alert_events(status,next_attempt_at)",
 		"CREATE INDEX IF NOT EXISTS idx_proxy_probe_jobs_expires ON proxy_probe_jobs(expires_at)",
 		"CREATE INDEX IF NOT EXISTS idx_proxy_model_bans_until ON proxy_model_bans(banned_until)",
+		"CREATE INDEX IF NOT EXISTS idx_compression_sessions_updated ON compression_sessions(updated_at)",
+		"CREATE INDEX IF NOT EXISTS idx_compression_events_created ON compression_events(created_at)",
 	} {
 		if _, indexErr := db.Exec(statement); indexErr != nil {
 			return indexErr
@@ -722,6 +728,14 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/settings/probes", a.requireAdmin(a.putProbeSettings))
 	mux.HandleFunc("GET /api/settings/alerts", a.requireAdmin(a.getAlertSettings))
 	mux.HandleFunc("PUT /api/settings/alerts", a.requireAdmin(a.putAlertSettings))
+	mux.HandleFunc("GET /api/settings/compression", a.requireAdmin(a.getCompressionSettings))
+	mux.HandleFunc("PUT /api/settings/compression", a.requireAdmin(a.putCompressionSettings))
+	mux.HandleFunc("POST /api/settings/compression/test", a.requireAdmin(a.testCompressionSettings))
+	mux.HandleFunc("GET /api/compression/stats", a.requireAdmin(a.compressionStats))
+	mux.HandleFunc("GET /api/compression/sessions", a.requireAdmin(a.listCompressionSessions))
+	mux.HandleFunc("POST /api/compression/sessions/reset", a.requireAdmin(a.resetCompressionSessions))
+	mux.HandleFunc("DELETE /api/compression/sessions/{key}", a.requireAdmin(a.deleteCompressionSession))
+	mux.HandleFunc("POST /api/compression/preview", a.requireAdmin(a.previewCompression))
 	webDir := getenv("WEB_DIR", "./web/dist")
 	mux.HandleFunc("/", serveSPA(webDir))
 }
@@ -981,7 +995,10 @@ func (a *App) getUpstream(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not count models"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"base_url": cfg.BaseURL, "has_api_key": cfg.APIKey != "", "vision_base_url": cfg.VisionBaseURL, "has_vision_api_key": cfg.VisionAPIKey != "", "vision_model": cfg.VisionModel, "vision_use_proxy": cfg.VisionUseProxy, "vision_configured": cfg.VisionBaseURL != "" && cfg.VisionModel != "", "custom_headers": cfg.CustomHeaders, "last_model_refresh_at": cfg.LastRefresh, "last_model_refresh_error": cfg.LastError, "free_model_count": models, "gateway_base_url": "/v1", "client_key_configured": a.clientKeyConfigured(), "session_proxy_request_limit": a.sessionProxyRequestLimit()})
+	// The upstream is not configurable: the lane endpoint, credential and
+	// disguise headers are constants (upstream_lane.go). The response still
+	// reports them so the UI can show what the gateway talks to.
+	writeJSON(w, 200, map[string]any{"upstream_lane": "zen-anonymous", "upstream_endpoint": upstreamEndpoint(laneBaseURL(), "/chat/completions"), "upstream_models_endpoint": upstreamEndpoint(laneBaseURL(), "/models"), "upstream_authorization": "Bearer " + zenAnonymousKey, "vision_base_url": cfg.VisionBaseURL, "has_vision_api_key": cfg.VisionAPIKey != "", "vision_model": cfg.VisionModel, "vision_use_proxy": cfg.VisionUseProxy, "vision_configured": cfg.VisionBaseURL != "" && cfg.VisionModel != "", "last_model_refresh_at": cfg.LastRefresh, "last_model_refresh_error": cfg.LastError, "free_model_count": models, "gateway_base_url": "/v1", "client_key_configured": a.clientKeyConfigured(), "session_proxy_request_limit": a.sessionProxyRequestLimit()})
 }
 
 func (a *App) putRouting(w http.ResponseWriter, r *http.Request) {
@@ -1073,23 +1090,22 @@ func (a *App) clientKeyConfigured() bool {
 	return a.db.QueryRow("SELECT value FROM settings WHERE key='client_key'").Scan(&hash) == nil && hash != ""
 }
 
+// putUpstream stores the optional vision bridge. The Zen lane itself is fixed
+// (see upstream_lane.go): an operator cannot point this gateway at another
+// upstream, so the only mutable part of the form is the vision supplier.
 func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		BaseURL        string             `json:"base_url"`
-		APIKey         string             `json:"api_key"`
-		VisionBaseURL  string             `json:"vision_base_url"`
-		VisionAPIKey   string             `json:"vision_api_key"`
-		VisionModel    string             `json:"vision_model"`
-		VisionUseProxy *bool              `json:"vision_use_proxy"`
-		CustomHeaders  *map[string]string `json:"custom_headers"`
+		VisionBaseURL  string `json:"vision_base_url"`
+		VisionAPIKey   string `json:"vision_api_key"`
+		VisionModel    string `json:"vision_model"`
+		VisionUseProxy *bool  `json:"vision_use_proxy"`
 	}
-	if readJSON(r, &in) != nil || in.BaseURL == "" {
-		writeJSON(w, 400, map[string]string{"error": "base_url is required"})
-		return
-	}
-	normalizedBaseURL, e := validateUpstreamBaseURL(in.BaseURL)
-	if e != nil {
-		writeJSON(w, 400, map[string]string{"error": e.Error()})
+	// Lenient on purpose: older clients still send base_url/api_key/
+	// custom_headers. Those fields no longer exist, so they are dropped instead
+	// of rejected.
+	body, bodyErr := readLimitedBody(r.Body, 2<<20)
+	if bodyErr != nil || json.Unmarshal(body, &in) != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid request body"})
 		return
 	}
 	old, loadErr := a.loadUpstream()
@@ -1097,14 +1113,14 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": loadErr.Error()})
 		return
 	}
-	in.APIKey = normalizeAPIKey(in.APIKey)
 	in.VisionBaseURL = strings.TrimSpace(in.VisionBaseURL)
 	if in.VisionBaseURL != "" {
-		in.VisionBaseURL, e = validateUpstreamBaseURL(in.VisionBaseURL)
+		normalized, e := validateUpstreamBaseURL(in.VisionBaseURL)
 		if e != nil {
 			writeJSON(w, 400, map[string]string{"error": "vision " + e.Error()})
 			return
 		}
+		in.VisionBaseURL = normalized
 	}
 	in.VisionAPIKey = normalizeAPIKey(in.VisionAPIKey)
 	if in.VisionAPIKey == "" {
@@ -1115,43 +1131,16 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 		in.VisionBaseURL = ""
 		in.VisionModel = ""
 	}
-	if in.APIKey == "" {
-		in.APIKey = old.APIKey
-	}
 	visionUseProxy := old.VisionUseProxy
 	if in.VisionUseProxy != nil {
 		visionUseProxy = *in.VisionUseProxy
-	}
-	headers := old.CustomHeaders
-	if in.CustomHeaders != nil {
-		var headerErr error
-		headers, headerErr = validateCustomHeaders(*in.CustomHeaders)
-		if headerErr != nil {
-			writeJSON(w, 400, map[string]string{"error": headerErr.Error()})
-			return
-		}
-	}
-	enc, e := a.encrypt(in.APIKey)
-	if e != nil {
-		writeJSON(w, 500, map[string]string{"error": "encryption failed"})
-		return
-	}
-	headersJSON, e := json.Marshal(headers)
-	if e != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not encode custom headers"})
-		return
-	}
-	headersEnc, e := a.encrypt(string(headersJSON))
-	if e != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not encrypt custom headers"})
-		return
 	}
 	visionEnc, e := a.encrypt(in.VisionAPIKey)
 	if e != nil {
 		writeJSON(w, 500, map[string]string{"error": "vision encryption failed"})
 		return
 	}
-	_, e = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('upstream_base_url',?),('upstream_api_key',?),('upstream_vision_base_url',?),('upstream_vision_api_key',?),('upstream_vision_model',?),('upstream_vision_use_proxy',?),('upstream_custom_headers',?)", normalizedBaseURL, enc, in.VisionBaseURL, visionEnc, in.VisionModel, strconv.FormatBool(visionUseProxy), headersEnc)
+	_, e = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('upstream_vision_base_url',?),('upstream_vision_api_key',?),('upstream_vision_model',?),('upstream_vision_use_proxy',?)", in.VisionBaseURL, visionEnc, in.VisionModel, strconv.FormatBool(visionUseProxy))
 	if e != nil {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
@@ -1183,39 +1172,9 @@ func (a *App) loadUpstream() (upstreamConfig, error) {
 }
 
 func (a *App) loadUpstreamFromDB() (upstreamConfig, error) {
-	cfg := upstreamConfig{CustomHeaders: defaultHeaders(), VisionUseProxy: true}
-	var b, e string
-	err := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_base_url'").Scan(&b)
-	if errors.Is(err, sql.ErrNoRows) {
-		return cfg, nil
-	}
-	if err != nil {
-		return cfg, err
-	}
-	if keyErr := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_api_key'").Scan(&e); keyErr != nil && !errors.Is(keyErr, sql.ErrNoRows) {
-		return cfg, keyErr
-	}
-	key, decryptErr := a.decrypt(e)
-	if decryptErr != nil {
-		return cfg, fmt.Errorf("could not decrypt upstream API key")
-	}
-	key = normalizeAPIKey(key)
-	var encryptedHeaders string
-	if err := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_custom_headers'").Scan(&encryptedHeaders); err == nil && encryptedHeaders != "" {
-		plain, decryptErr := a.decrypt(encryptedHeaders)
-		if decryptErr != nil {
-			return cfg, fmt.Errorf("could not decrypt custom headers")
-		}
-		var headers map[string]string
-		if json.Unmarshal([]byte(plain), &headers) != nil {
-			return cfg, fmt.Errorf("stored custom headers are invalid")
-		}
-		validated, headerErr := validateCustomHeaders(headers)
-		if headerErr != nil {
-			return cfg, fmt.Errorf("stored custom headers are invalid")
-		}
-		cfg.CustomHeaders = validated
-	}
+	// The lane endpoint and credential are constants; only the optional vision
+	// supplier and the refresh bookkeeping come from the database.
+	cfg := upstreamConfig{BaseURL: laneBaseURL(), APIKey: zenAnonymousKey, VisionUseProxy: true}
 	var visionBaseURL, visionModel, encryptedVisionKey string
 	if visionErr := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_vision_base_url'").Scan(&visionBaseURL); visionErr != nil && !errors.Is(visionErr, sql.ErrNoRows) {
 		return cfg, visionErr
@@ -1225,6 +1184,7 @@ func (a *App) loadUpstreamFromDB() (upstreamConfig, error) {
 	}
 	visionKey := ""
 	if encryptedVisionKey != "" {
+		var decryptErr error
 		visionKey, decryptErr = a.decrypt(encryptedVisionKey)
 		if decryptErr != nil {
 			return cfg, fmt.Errorf("could not decrypt vision API key")
@@ -1254,8 +1214,6 @@ func (a *App) loadUpstreamFromDB() (upstreamConfig, error) {
 	if parsed, x := time.Parse(time.RFC3339, lr); x == nil {
 		t = &parsed
 	}
-	cfg.BaseURL = b
-	cfg.APIKey = key
 	cfg.VisionBaseURL = strings.TrimRight(strings.TrimSpace(visionBaseURL), "/")
 	cfg.VisionAPIKey = visionKey
 	cfg.VisionModel = strings.TrimSpace(visionModel)
@@ -1290,71 +1248,6 @@ func validateUpstreamBaseURL(raw string) (string, error) {
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func defaultHeaders() map[string]string {
-	headers := make(map[string]string, len(defaultUpstreamHeaders))
-	for name, value := range defaultUpstreamHeaders {
-		headers[name] = value
-	}
-	return headers
-}
-
-func validateCustomHeaders(headers map[string]string) (map[string]string, error) {
-	if len(headers) > 32 {
-		return nil, fmt.Errorf("too many custom headers (maximum 32)")
-	}
-	validated := make(map[string]string, len(headers))
-	for rawName, rawValue := range headers {
-		name := strings.TrimSpace(rawName)
-		value := strings.TrimSpace(rawValue)
-		if !validHeaderName(name) {
-			return nil, fmt.Errorf("invalid header name %q", rawName)
-		}
-		if !validHeaderValue(value) {
-			return nil, fmt.Errorf("header %q contains an invalid value", name)
-		}
-		if _, reserved := protectedUpstreamHeaders[strings.ToLower(name)]; reserved {
-			return nil, fmt.Errorf("header %q is managed by the gateway", name)
-		}
-		canonical := http.CanonicalHeaderKey(name)
-		if _, duplicate := validated[canonical]; duplicate {
-			return nil, fmt.Errorf("duplicate header %q", name)
-		}
-		validated[canonical] = value
-	}
-	return validated, nil
-}
-
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			continue
-		}
-		if !strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
-			return false
-		}
-	}
-	return true
-}
-
-func validHeaderValue(value string) bool {
-	for i := 0; i < len(value); i++ {
-		if value[i] < 0x20 || value[i] == 0x7f {
-			return false
-		}
-	}
-	return true
-}
-
-func applyCustomHeaders(req *http.Request, headers map[string]string) {
-	for name, value := range headers {
-		req.Header.Set(name, value)
-	}
-}
-
 func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 	cfg, e := a.loadUpstream()
 	if e != nil || cfg.BaseURL == "" {
@@ -1366,7 +1259,7 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid upstream endpoint"})
 		return
 	}
-	applyUpstreamHeaders(req, cfg)
+	applyLaneHeaders(req, a.catalogSession())
 	p, engine, proxyErr := a.controlPlaneProxy()
 	if proxyErr != nil {
 		a.saveRefreshError(proxyErr.Error())
@@ -1475,11 +1368,11 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "free_model_count": free})
 }
 
-func applyUpstreamHeaders(req *http.Request, cfg upstreamConfig) {
-	applyCustomHeaders(req, cfg.CustomHeaders)
-	if cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-	}
+// catalogSession is the session id the gateway presents when it reads the
+// upstream catalog or probes the lane. Catalog traffic is not a conversation,
+// so it gets one stable id rather than one per request.
+func (a *App) catalogSession() string {
+	return a.laneSessionID("gateway\x00catalog")
 }
 
 func (a *App) testUpstream(w http.ResponseWriter, r *http.Request) {
@@ -1521,13 +1414,12 @@ func (a *App) testUpstreamRequest(ctx context.Context, cfg upstreamConfig, body 
 		if requestErr != nil {
 			err = requestErr
 		} else {
-			applyUpstreamHeaders(req, cfg)
-			req.Header.Set("Content-Type", "application/json")
+			applyLaneHeaders(req, a.catalogSession())
 			resp, err = (&http.Client{Timeout: 90 * time.Second}).Do(req)
 		}
 	} else {
 		req, _ := http.NewRequestWithContext(ctx, "POST", "http://relaydesk.invalid", nil)
-		resp, err = a.forward(req, body, cfg, *p)
+		resp, err = a.forward(req, body, cfg, *p, a.catalogSession())
 	}
 	result := map[string]any{}
 	if p != nil {
@@ -1892,6 +1784,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The free lane's agent-shape gate wants the CLI's own tools in the payload;
+	// the client's body is extended only when they are missing.
+	forwardBody = ensureFreeLaneShape(forwardBody)
 	cfg, cfgErr := a.loadUpstream()
 	if cfgErr != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": cfgErr.Error()})
@@ -1945,6 +1840,33 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	requestSessionKey := sessionKey(r, parsed.User, parsed.Messages)
+	// The upstream session id is a separate identity from the rotation affinity:
+	// it must always exist (the free lane rejects a request without a canonical
+	// ses_ id) and it must survive the whole conversation so upstream keeps its
+	// prompt cache and per-session quota accounting.
+	laneSession := a.laneSessionID(laneSessionSignal(r, parsed.User, parsed.Messages, hashToken(clientCredential(r))))
+	// The compression gateway folds already-consumed history into one summary
+	// message. It runs on the parsed payload so the rewritten body keeps the
+	// model rewrite, and the free-lane shape is re-applied afterwards.
+	compression := a.applyCompression(r, requestSessionKey, resolvedModel, requestPayload)
+	if compression.Applied {
+		if rewritten, rewriteErr := json.Marshal(requestPayload); rewriteErr == nil {
+			forwardBody = ensureFreeLaneShape(rewritten)
+			if messages, ok := requestPayload["messages"].([]any); ok {
+				parsed.Messages = messages
+			}
+		}
+	}
+	setCompressionHeaders(w, compression)
+	if compression.Blocking {
+		detail := "compression gateway failed"
+		if compression.Err != nil {
+			detail += ": " + truncateError(compression.Err.Error())
+		}
+		a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, nil, "", "direct", "error", http.StatusBadGateway, time.Since(start), nil, 0, nil, nil, clientUserAgent, parsed.Stream, errors.New(detail))
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": detail, "code": "compression_failed"})
+		return
+	}
 	var resinRoute *resinRequestRoute
 	if resinMode {
 		resinRoute, err = newResinRequestRoute(requestSessionKey)
@@ -2017,10 +1939,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", 0, time.Since(helperStarted), nil, i, nil, buildErr)
 				break
 			}
-			visionCfg := upstreamConfig{BaseURL: cfg.VisionBaseURL, APIKey: cfg.VisionAPIKey}
+			visionCfg := upstreamConfig{VisionBaseURL: cfg.VisionBaseURL, VisionAPIKey: cfg.VisionAPIKey}
 			helperCtx, helperCancel := visionRequestContext(r)
 			helperRequest := r.Clone(helperCtx)
-			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, helperProxy)
+			helpResp, helpErr := a.forwardVision(helperRequest, helpBody, visionCfg, helperProxy)
 			if helpErr != nil {
 				helperCancel()
 				lastErr = fmt.Errorf("vision helper request failed: %w", helpErr)
@@ -2105,7 +2027,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
-		resp, e := a.forward(r, bodyToForward, cfg, p)
+		resp, e := a.forward(r, bodyToForward, cfg, p, laneSession)
 		if e != nil {
 			lastErr = e
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
@@ -2244,13 +2166,31 @@ func lastErrString(e error) string {
 	}
 	return e.Error()
 }
-func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord) (*http.Response, error) {
+func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, session string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	applyUpstreamHeaders(req, cfg)
+	applyLaneHeaders(req, session)
+	client, err := a.httpClient(p)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+// forwardVision sends the image-description request to the operator's own
+// multimodal supplier. It is a different upstream with its own credential, so it
+// gets neither the Zen endpoint nor the CLI disguise headers.
+func (a *App) forwardVision(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.VisionBaseURL, "/chat/completions"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
+	if cfg.VisionAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.VisionAPIKey)
+	}
 	client, err := a.httpClient(p)
 	if err != nil {
 		return nil, err

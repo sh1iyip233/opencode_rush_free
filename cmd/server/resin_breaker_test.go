@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,19 +9,29 @@ import (
 	"time"
 )
 
-func TestResinBreakerOpensAfterConsecutiveLimits(t *testing.T) {
+// distinctAccounts returns the account names one breaker test walks through.
+func distinctAccounts(n int) []string {
+	accounts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		accounts = append(accounts, fmt.Sprintf("acct-%02d", i))
+	}
+	return accounts
+}
+
+func TestResinBreakerOpensAfterDistinctExitsAreLimited(t *testing.T) {
 	a := testApp(t)
 	threshold := a.resinBreakerThreshold()
 	if threshold != resinBreakerDefault {
 		t.Fatalf("threshold = %d, want default %d", threshold, resinBreakerDefault)
 	}
-	for i := 0; i < threshold-1; i++ {
-		a.noteResinLimited()
+	accounts := distinctAccounts(threshold)
+	for _, account := range accounts[:threshold-1] {
+		a.noteResinLimited(account)
 	}
 	if a.resinBreakerOpenNow() {
 		t.Fatal("breaker opened before the threshold was reached")
 	}
-	a.noteResinLimited()
+	a.noteResinLimited(accounts[threshold-1])
 	if !a.resinBreakerOpenNow() {
 		t.Fatal("breaker did not open at the threshold")
 	}
@@ -33,14 +44,29 @@ func TestResinBreakerOpensAfterConsecutiveLimits(t *testing.T) {
 	}
 }
 
+// One exit answering 429 over and over is a sick exit, not a sick pool: the
+// breaker must not black out every other account because of it.
+func TestResinBreakerIgnoresRepeatedLimitsOnOneExit(t *testing.T) {
+	a := testApp(t)
+	threshold := a.resinBreakerThreshold()
+	for i := 0; i < threshold*3; i++ {
+		a.noteResinLimited("acct-stuck")
+	}
+	if a.resinBreakerOpenNow() {
+		t.Fatalf("breaker opened after %d limits on a single exit", threshold*3)
+	}
+}
+
 func TestResinBreakerResetsOnHealthyAnswer(t *testing.T) {
 	a := testApp(t)
-	for i := 0; i < a.resinBreakerThreshold()-1; i++ {
-		a.noteResinLimited()
+	threshold := a.resinBreakerThreshold()
+	accounts := distinctAccounts(threshold)
+	for _, account := range accounts[:threshold-1] {
+		a.noteResinLimited(account)
 	}
 	a.noteResinHealthy()
-	for i := 0; i < a.resinBreakerThreshold()-1; i++ {
-		a.noteResinLimited()
+	for _, account := range accounts[:threshold-1] {
+		a.noteResinLimited(account)
 	}
 	if a.resinBreakerOpenNow() {
 		t.Fatal("breaker opened although a success had reset the streak")
@@ -49,15 +75,17 @@ func TestResinBreakerResetsOnHealthyAnswer(t *testing.T) {
 
 func TestResinBreakerIgnoresExpiredStreak(t *testing.T) {
 	a := testApp(t)
-	for i := 0; i < a.resinBreakerThreshold()-1; i++ {
-		a.noteResinLimited()
+	threshold := a.resinBreakerThreshold()
+	accounts := distinctAccounts(threshold)
+	for _, account := range accounts[:threshold-1] {
+		a.noteResinLimited(account)
 	}
 	// Age the streak past the window: old 429s must not count toward the threshold.
 	a.resinBreakerMu.Lock()
 	a.resinBreakerSince = time.Now().Add(-2 * resinBreakerWindow)
 	a.resinBreakerMu.Unlock()
-	for i := 0; i < a.resinBreakerThreshold()-1; i++ {
-		a.noteResinLimited()
+	for _, account := range accounts[:threshold-1] {
+		a.noteResinLimited(account)
 	}
 	if a.resinBreakerOpenNow() {
 		t.Fatal("breaker counted 429s from an expired window")

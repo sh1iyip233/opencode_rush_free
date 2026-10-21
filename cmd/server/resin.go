@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,6 +23,7 @@ const (
 	resinGatewayURLSettingKey  = "resin_gateway_url"
 	resinProxyTokenSettingKey  = "resin_proxy_token"
 	resinPlatformSettingKey    = "resin_platform"
+	resinIPProbeURLSettingKey  = "resin_ip_probe_url"
 	resinFallbackActiveSetting = "resin_fallback_active"
 	resinFallbackSinceSetting  = "resin_fallback_since"
 	resinFallbackReasonSetting = "resin_fallback_reason"
@@ -58,6 +61,20 @@ const (
 	// reuses a cooling one, and how many cooled accounts are remembered.
 	resinAccountProbeLimit = 8
 	resinAccountCoolLimit  = 4096
+	// The upstream rate limit is per exit IP, and a freshly drawn account can
+	// land on an IP that another account was just limited on, so the park table
+	// remembers the IP behind an account as well as the account itself. The
+	// mapping is learned through an IP echo service and only trusted while a
+	// sticky session would plausibly still hold it.
+	resinIPProbeDefault   = "https://api.ipify.org"
+	resinExitIPTTL        = 15 * time.Minute
+	resinExitIPLimit      = 4096
+	resinExitProbeSlots   = 4
+	resinExitProbeTimeout = 4 * time.Second
+	resinExitProbeBodyMax = 128
+	// Setting the probe URL to this value disables exit-IP learning and leaves
+	// the gateway on account-keyed cooldown alone.
+	resinIPProbeDisabled = "off"
 )
 
 type proxyEngineConfig struct {
@@ -65,6 +82,9 @@ type proxyEngineConfig struct {
 	ResinGatewayURL string
 	ResinProxyToken string
 	ResinPlatform   string
+	// ResinIPProbeURL is the IP echo service used to learn which exit an
+	// account currently uses. Empty means the feature is switched off.
+	ResinIPProbeURL string
 	FallbackActive  bool
 	FallbackSince   *time.Time
 	FallbackReason  string
@@ -85,10 +105,19 @@ type proxyEngineStatus struct {
 	ResinLastCheckedAt  *time.Time `json:"resin_last_checked_at,omitempty"`
 	ResinLastCheckError string     `json:"resin_last_check_error,omitempty"`
 	ResinHealth         string     `json:"resin_health"`
+	// ResinIPProbeURL is the IP echo service used to learn the exit IP behind an
+	// account; empty when exit-IP learning is switched off.
+	ResinIPProbeURL string `json:"resin_ip_probe_url"`
 	// ResinCooledAccounts is how many exits are parked after a 429 right now.
 	ResinCooledAccounts int `json:"resin_cooled_accounts"`
-	// ResinBreakerOpen is the fast-fail state: enough consecutive 429s proved the
-	// pool saturated, so requests are answered at once instead of feeding the storm.
+	// ResinCooledExitIPs is how many exit IPs are parked right now, which is the
+	// number that matters when the upstream limits per IP.
+	ResinCooledExitIPs int `json:"resin_cooled_exit_ips"`
+	// ResinKnownExitIPs is how many account-to-exit-IP mappings are cached.
+	ResinKnownExitIPs int `json:"resin_known_exit_ips"`
+	// ResinBreakerOpen is the fast-fail state: enough distinct exits were
+	// limited that the pool is saturated, so requests are answered at once
+	// instead of feeding the storm.
 	ResinBreakerOpen            bool `json:"resin_breaker_open"`
 	ResinRetryBudgetSeconds     int  `json:"resin_retry_budget_seconds"`
 	ResinBreakerThreshold       int  `json:"resin_breaker_threshold"`
@@ -165,10 +194,15 @@ func (a *App) resinBreakerRemaining() time.Duration {
 	return 0
 }
 
-// noteResinLimited counts one upstream 429. Enough of them inside the window
-// open the breaker: retrying a saturated pool only lengthens the limit, so the
-// gateway answers immediately and lets the client back off instead.
-func (a *App) noteResinLimited() {
+// noteResinLimited records that one exit was rate limited inside the current
+// window and opens the breaker once enough *distinct* exits have been limited.
+//
+// Counting exits instead of raw 429s is what separates the two failure shapes:
+// one caller walking through ten accounts produces ten 429s but only one sick
+// pool report per exit, while a genuinely saturated pool limits many different
+// exits at once. The caller also reports at most one exit per request, so a
+// single unlucky request cannot black out the pool for everybody else.
+func (a *App) noteResinLimited(account string) {
 	threshold := a.resinBreakerThreshold()
 	cooldown := a.resinBreakerCooldown()
 	now := time.Now()
@@ -176,21 +210,28 @@ func (a *App) noteResinLimited() {
 	defer a.resinBreakerMu.Unlock()
 	if a.resinBreakerSince.IsZero() || now.Sub(a.resinBreakerSince) > resinBreakerWindow {
 		a.resinBreakerSince = now
-		a.resinBreakerHits = 0
+		a.resinBreakerExits = nil
 	}
-	a.resinBreakerHits++
-	if a.resinBreakerHits >= threshold {
+	if a.resinBreakerExits == nil {
+		a.resinBreakerExits = make(map[string]time.Time)
+	}
+	key := account
+	if key == "" {
+		key = "unknown"
+	}
+	a.resinBreakerExits[key] = now
+	if len(a.resinBreakerExits) >= threshold {
 		a.resinBreakerOpenUntil = now.Add(cooldown)
-		a.resinBreakerHits = 0
+		a.resinBreakerExits = nil
 		a.resinBreakerSince = time.Time{}
-		log.Printf("resin breaker open for %s after %d consecutive 429s", cooldown, threshold)
+		log.Printf("resin breaker open for %s after %d distinct exits were limited", cooldown, threshold)
 	}
 }
 
 // noteResinHealthy clears the streak; one success proves the pool is moving again.
 func (a *App) noteResinHealthy() {
 	a.resinBreakerMu.Lock()
-	a.resinBreakerHits = 0
+	a.resinBreakerExits = nil
 	a.resinBreakerSince = time.Time{}
 	a.resinBreakerOpenUntil = time.Time{}
 	a.resinBreakerMu.Unlock()
@@ -238,6 +279,18 @@ func (a *App) loadProxyEngineFromDB() (proxyEngineConfig, error) {
 	}
 	if cfg.ResinPlatform == "" {
 		cfg.ResinPlatform = "Default"
+	}
+	probeURL, err := settingValue(a.db, resinIPProbeURLSettingKey)
+	if err != nil {
+		return cfg, err
+	}
+	switch strings.TrimSpace(probeURL) {
+	case "":
+		cfg.ResinIPProbeURL = resinIPProbeDefault
+	case resinIPProbeDisabled:
+		cfg.ResinIPProbeURL = ""
+	default:
+		cfg.ResinIPProbeURL = strings.TrimSpace(probeURL)
 	}
 	var encryptedToken string
 	if encryptedToken, err = settingValue(a.db, resinProxyTokenSettingKey); err != nil {
@@ -299,6 +352,24 @@ func validateResinPlatform(raw string) (string, error) {
 	return value, nil
 }
 
+// normalizeResinIPProbeURL accepts the stored form of the exit-IP probe setting:
+// an http(s) URL, "off" to disable learning, or empty to fall back to the
+// built-in default.
+func normalizeResinIPProbeURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if strings.EqualFold(value, resinIPProbeDisabled) {
+		return resinIPProbeDisabled, nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", errors.New("resin_ip_probe_url must be an http(s) URL or off")
+	}
+	return value, nil
+}
+
 func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 	cfg, err := a.loadProxyEngine()
 	if err != nil {
@@ -329,7 +400,10 @@ func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 		ResinLastCheckedAt:  cfg.LastCheckedAt,
 		ResinLastCheckError: cfg.LastCheckError,
 		ResinHealth:         health,
+		ResinIPProbeURL:     cfg.ResinIPProbeURL,
 		ResinCooledAccounts: a.cooledResinAccounts(),
+		ResinCooledExitIPs:  a.cooledResinExitIPs(),
+		ResinKnownExitIPs:   a.knownResinExitIPs(),
 
 		ResinBreakerOpen:            a.resinBreakerOpenNow(),
 		ResinRetryBudgetSeconds:     a.settingInt(resinRetryBudgetSettingKey, resinRetryBudgetDefault, resinRetryBudgetMin, resinRetryBudgetMax),
@@ -356,6 +430,7 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 		ResinRetryBudgetSeconds     *int    `json:"resin_retry_budget_seconds"`
 		ResinBreakerThreshold       *int    `json:"resin_breaker_threshold"`
 		ResinBreakerCooldownSeconds *int    `json:"resin_breaker_cooldown_seconds"`
+		ResinIPProbeURL             *string `json:"resin_ip_probe_url"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid proxy engine configuration"})
@@ -395,6 +470,13 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 	token := old.ResinProxyToken
 	if in.ResinProxyToken != nil {
 		token = strings.TrimSpace(*in.ResinProxyToken)
+	}
+	probeURL := old.ResinIPProbeURL
+	if in.ResinIPProbeURL != nil {
+		if probeURL, err = normalizeResinIPProbeURL(*in.ResinIPProbeURL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 	encryptedToken, err := a.encrypt(token)
 	if err != nil {
@@ -436,6 +518,12 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		values = append(values, [2]string{knob.key, strconv.Itoa(*knob.value)})
+	}
+	// Only write the probe URL when the caller supplied one: the row has to keep
+	// its stored form ("off" disables learning, empty means the default), and
+	// rewriting it from the effective value would turn "off" back into "default".
+	if in.ResinIPProbeURL != nil {
+		values = append(values, [2]string{resinIPProbeURLSettingKey, probeURL})
 	}
 	if engine == proxyEngineBuiltin {
 		values = append(values,
@@ -556,10 +644,11 @@ func (route *resinRequestRoute) proxy(a *App, cfg proxyEngineConfig) (ProxyRecor
 		return ProxyRecord{}, err
 	}
 	account := route.accountFor(base)
-	// Skip every account the gateway has just seen a 429 for. Probing is local:
-	// it costs a hash, not an upstream round trip.
+	// Skip every account the gateway has just seen a 429 for, and every account
+	// whose known exit IP is parked. Probing is local: it costs a hash, not an
+	// upstream round trip.
 	for probes := 0; probes < resinAccountProbeLimit; probes++ {
-		if _, cooling := a.resinAccountCooling(account); !cooling {
+		if a.resinExitUsable(account) {
 			break
 		}
 		nonce, nonceErr := randomKey()
@@ -570,6 +659,13 @@ func (route *resinRequestRoute) proxy(a *App, cfg proxyEngineConfig) (ProxyRecor
 		account = route.accountFor(base)
 	}
 	route.lastAccount = account
+	// A sticky route reuses this account for many requests, so one probe per
+	// account is amortized and makes the next draw able to avoid a dirty exit.
+	if route.sessionKey != "" {
+		if _, known := a.resinExitIP(account); !known {
+			a.learnResinExitIPAsync(account, 0)
+		}
+	}
 	return a.resinProxy(cfg, account)
 }
 
@@ -595,6 +691,30 @@ func resinAccountOf(p ProxyRecord) string {
 		return account
 	}
 	return p.Username
+}
+
+// shortResinAccount keeps enough of an account hash to correlate log lines and
+// status output without echoing a credential-shaped string in full.
+func shortResinAccount(account string) string {
+	const keep = 8
+	if len(account) <= keep {
+		return account
+	}
+	return account[:keep]
+}
+
+// resinAttemptEntry annotates one attempt record with the exit identity that
+// served it, so the usage API can answer "which account and IP answered 429"
+// instead of leaving the reader with a bare proxy URL.
+func (a *App) resinAttemptEntry(entry map[string]any, route *resinRequestRoute) map[string]any {
+	if route == nil || route.lastAccount == "" {
+		return entry
+	}
+	entry["account"] = shortResinAccount(route.lastAccount)
+	if ip, known := a.resinExitIP(route.lastAccount); known {
+		entry["exit_ip"] = ip
+	}
+	return entry
 }
 
 // resinAccountCooling reports how long an account is still parked. An expired
@@ -685,6 +805,286 @@ func (a *App) cooledResinAccounts() int {
 // resinAccountCooldownFor turns the upstream's Retry-After into a park time.
 func resinAccountCooldownFor(resp *http.Response) time.Duration {
 	return retryAfterDuration(resp)
+}
+
+// resinExitIPRecord is one learned account-to-exit-IP mapping. The upstream
+// limits per IP, so this is the identity the park table actually cares about;
+// the account is only the handle the provider gives us.
+type resinExitIPRecord struct {
+	IP        string
+	LearnedAt time.Time
+}
+
+// resinExitIP returns the exit IP last observed behind an account. A mapping
+// older than resinExitIPTTL is dropped: the provider may have moved the account
+// to another exit, and a stale IP would park an innocent one.
+func (a *App) resinExitIP(account string) (string, bool) {
+	if account == "" {
+		return "", false
+	}
+	now := time.Now()
+	a.resinExitMu.Lock()
+	defer a.resinExitMu.Unlock()
+	record, ok := a.resinExitIPs[account]
+	if !ok {
+		return "", false
+	}
+	if now.Sub(record.LearnedAt) > resinExitIPTTL {
+		delete(a.resinExitIPs, account)
+		return "", false
+	}
+	return record.IP, true
+}
+
+// rememberResinExitIP stores one learned mapping, bounded the same way the park
+// table is: expired entries first, then the least recently learned one.
+func (a *App) rememberResinExitIP(account, ip string) {
+	if account == "" || ip == "" {
+		return
+	}
+	now := time.Now()
+	a.resinExitMu.Lock()
+	defer a.resinExitMu.Unlock()
+	if a.resinExitIPs == nil {
+		a.resinExitIPs = make(map[string]resinExitIPRecord)
+	}
+	if len(a.resinExitIPs) >= resinExitIPLimit {
+		for key, record := range a.resinExitIPs {
+			if now.Sub(record.LearnedAt) > resinExitIPTTL {
+				delete(a.resinExitIPs, key)
+			}
+		}
+		if len(a.resinExitIPs) >= resinExitIPLimit {
+			var oldestKey string
+			var oldest time.Time
+			for key, record := range a.resinExitIPs {
+				if oldestKey == "" || record.LearnedAt.Before(oldest) {
+					oldestKey, oldest = key, record.LearnedAt
+				}
+			}
+			delete(a.resinExitIPs, oldestKey)
+		}
+	}
+	a.resinExitIPs[account] = resinExitIPRecord{IP: ip, LearnedAt: now}
+}
+
+// knownResinExitIPs reports how many live mappings are cached right now.
+func (a *App) knownResinExitIPs() int {
+	now := time.Now()
+	a.resinExitMu.Lock()
+	defer a.resinExitMu.Unlock()
+	count := 0
+	for _, record := range a.resinExitIPs {
+		if now.Sub(record.LearnedAt) <= resinExitIPTTL {
+			count++
+		}
+	}
+	return count
+}
+
+// resinExitIPCooling reports how long an exit IP is still parked.
+func (a *App) resinExitIPCooling(ip string) (time.Duration, bool) {
+	if ip == "" {
+		return 0, false
+	}
+	now := time.Now()
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	until, ok := a.resinCooledIPs[ip]
+	if !ok {
+		return 0, false
+	}
+	if !until.After(now) {
+		delete(a.resinCooledIPs, ip)
+		return 0, false
+	}
+	return until.Sub(now), true
+}
+
+// coolResinExitIP parks one exit IP for the requested time, clamped exactly like
+// the account park so the two identities cannot drift apart.
+func (a *App) coolResinExitIP(ip string, cooldown time.Duration) {
+	if ip == "" {
+		return
+	}
+	if cooldown < resinAccountCooldownFloor {
+		cooldown = resinAccountCooldownFloor
+	}
+	if cooldown > resinAccountCooldownCeil {
+		cooldown = resinAccountCooldownCeil
+	}
+	until := time.Now().Add(cooldown)
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	if a.resinCooledIPs == nil {
+		a.resinCooledIPs = make(map[string]time.Time)
+	}
+	if len(a.resinCooledIPs) >= resinExitIPLimit {
+		for key, expiry := range a.resinCooledIPs {
+			if !expiry.After(time.Now()) {
+				delete(a.resinCooledIPs, key)
+			}
+		}
+		if len(a.resinCooledIPs) >= resinExitIPLimit {
+			var oldestKey string
+			var oldest time.Time
+			for key, expiry := range a.resinCooledIPs {
+				if oldestKey == "" || expiry.Before(oldest) {
+					oldestKey, oldest = key, expiry
+				}
+			}
+			delete(a.resinCooledIPs, oldestKey)
+		}
+	}
+	a.resinCooledIPs[ip] = until
+}
+
+// cooledResinExitIPs reports how many exit IPs are parked right now.
+func (a *App) cooledResinExitIPs() int {
+	now := time.Now()
+	a.resinCoolMu.Lock()
+	defer a.resinCoolMu.Unlock()
+	count := 0
+	for _, until := range a.resinCooledIPs {
+		if until.After(now) {
+			count++
+		}
+	}
+	return count
+}
+
+// resinExitUsable reports whether an account may be drawn right now: neither the
+// account nor the exit IP last seen behind it may be parked. Checking the IP is
+// what catches a fresh account that happens to land on an exit another account
+// was just limited on.
+func (a *App) resinExitUsable(account string) bool {
+	if _, cooling := a.resinAccountCooling(account); cooling {
+		return false
+	}
+	if ip, known := a.resinExitIP(account); known {
+		if _, cooling := a.resinExitIPCooling(ip); cooling {
+			return false
+		}
+	}
+	return true
+}
+
+// learnResinExitIPAsync asks an IP echo service which exit an account currently
+// uses. It is deliberately asynchronous: the answer is only useful for a later
+// draw, and blocking a request on a probe would cost more than the wasted
+// attempt it prevents. When coolFor is positive the learned IP is parked as
+// well, which is how a 429 teaches the table about an IP it never saw.
+func (a *App) learnResinExitIPAsync(account string, coolFor time.Duration) {
+	if account == "" {
+		return
+	}
+	a.resinExitMu.Lock()
+	if a.resinExitProbes == nil {
+		a.resinExitProbes = make(map[string]struct{})
+	}
+	if _, busy := a.resinExitProbes[account]; busy {
+		a.resinExitMu.Unlock()
+		return
+	}
+	a.resinExitProbes[account] = struct{}{}
+	a.resinExitMu.Unlock()
+
+	slots := a.resinExitProbeSlots()
+	select {
+	case slots <- struct{}{}:
+	default:
+		// Every slot is busy: drop this probe instead of queueing work behind a
+		// path that is already under stress.
+		a.resinExitMu.Lock()
+		delete(a.resinExitProbes, account)
+		a.resinExitMu.Unlock()
+		return
+	}
+	go func() {
+		defer func() {
+			<-slots
+			a.resinExitMu.Lock()
+			delete(a.resinExitProbes, account)
+			a.resinExitMu.Unlock()
+		}()
+		ip, err := a.probeResinExitIP(account)
+		if err != nil || ip == "" {
+			return
+		}
+		a.rememberResinExitIP(account, ip)
+		if coolFor > 0 {
+			a.coolResinExitIP(ip, coolFor)
+		}
+	}()
+}
+
+func (a *App) resinExitProbeSlots() chan struct{} {
+	a.resinExitMu.Lock()
+	defer a.resinExitMu.Unlock()
+	if a.resinExitSlots == nil {
+		a.resinExitSlots = make(chan struct{}, resinExitProbeSlots)
+	}
+	return a.resinExitSlots
+}
+
+// probeResinExitIP performs the one request the learning path needs, through the
+// account's own proxy so the answer is the exit that account really uses.
+func (a *App) probeResinExitIP(account string) (string, error) {
+	cfg, err := a.loadProxyEngine()
+	if err != nil {
+		return "", err
+	}
+	if cfg.Engine != proxyEngineResin {
+		return "", errors.New("Resin is not the active proxy engine")
+	}
+	probeURL := strings.TrimSpace(cfg.ResinIPProbeURL)
+	if probeURL == "" {
+		return "", errors.New("exit IP learning is disabled")
+	}
+	p, err := a.resinProxy(cfg, account)
+	if err != nil {
+		return "", err
+	}
+	client, err := a.httpClient(p)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), resinExitProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("exit IP probe returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, resinExitProbeBodyMax))
+	if err != nil {
+		return "", err
+	}
+	ip := normalizeExitIP(string(body))
+	if ip == "" {
+		return "", errors.New("exit IP probe returned an unrecognised answer")
+	}
+	return ip, nil
+}
+
+// normalizeExitIP keeps only a plausible address, so a captive portal or an HTML
+// error page can never be mistaken for an exit IP.
+func normalizeExitIP(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	if net.ParseIP(value) == nil {
+		return ""
+	}
+	return value
 }
 
 func (a *App) resinControlPlaneProxy() (ProxyRecord, error) {

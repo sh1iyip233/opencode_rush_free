@@ -50,8 +50,13 @@ type App struct {
 	resinLastAutoProbe      time.Time
 	resinCoolMu             sync.Mutex
 	resinCooledAccounts     map[string]time.Time
+	resinCooledIPs          map[string]time.Time
+	resinExitMu             sync.Mutex
+	resinExitIPs            map[string]resinExitIPRecord
+	resinExitProbes         map[string]struct{}
+	resinExitSlots          chan struct{}
 	resinBreakerMu          sync.Mutex
-	resinBreakerHits        int
+	resinBreakerExits       map[string]time.Time
 	resinBreakerSince       time.Time
 	resinBreakerOpenUntil   time.Time
 	gatewaySem              chan struct{}
@@ -1975,6 +1980,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	// early, so the terminal answer is derived from these.
 	attemptsMade := 0
 	limitedAttempts := 0
+	// The breaker is told about one limited exit per request, not one per
+	// attempt: a chain that walks ten accounts says nothing about the pool.
+	limitedExitNoted := false
 	used := map[int64]struct{}{}
 	// A ban is a refusal of one exit and model pairing, not of the exit, so the
 	// banned set is loaded per request and only used to order candidates.
@@ -2048,7 +2056,17 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		retryCount = i
 		attemptsMade = i + 1
 		lastProxyURI = p.URI
-		traceNote(r, "attempt %d/%d engine=%s proxy=%s", i+1, attempts, routeEngine, redactProxyURI(p.URI))
+		// An attempt line has to name the exit it used, otherwise a 429 in the
+		// log cannot be tied to an account or an IP after the fact.
+		attemptTag := ""
+		if resinMode {
+			account := resinRoute.lastAccount
+			attemptTag = " acct=" + shortResinAccount(account)
+			if ip, known := a.resinExitIP(account); known {
+				attemptTag += " ip=" + ip
+			}
+		}
+		traceNote(r, "attempt %d/%d engine=%s proxy=%s%s", i+1, attempts, routeEngine, redactProxyURI(p.URI), attemptTag)
 		bodyToForward := forwardBody
 		if visionEnabled {
 			helperStarted := time.Now()
@@ -2136,8 +2154,17 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				if cfg.VisionUseProxy && i+1 < attempts && (helpStatus == http.StatusTooManyRequests || helpStatus == http.StatusUnauthorized || helpStatus == http.StatusForbidden) {
 					if resinMode {
 						if helpStatus == http.StatusTooManyRequests {
-							a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(helpResp))
-							a.noteResinLimited()
+							helperCooldown := resinAccountCooldownFor(helpResp)
+							a.coolResinAccount(resinRoute.lastAccount, helperCooldown)
+							if ip, known := a.resinExitIP(resinRoute.lastAccount); known {
+								a.coolResinExitIP(ip, helperCooldown)
+							} else {
+								a.learnResinExitIPAsync(resinRoute.lastAccount, helperCooldown)
+							}
+							if !limitedExitNoted {
+								a.noteResinLimited(resinRoute.lastAccount)
+								limitedExitNoted = true
+							}
 						}
 						_ = resinRoute.advance(a)
 					} else {
@@ -2176,7 +2203,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			lastErr = e
 			traceNote(r, "attempt %d transport error: %s", i+1, truncateError(e.Error()))
-			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
+			attemptSummary = append(attemptSummary, a.resinAttemptEntry(map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()}, resinRoute))
 			if requestErr := r.Context().Err(); requestErr != nil {
 				downstreamErr = requestErr
 				lastErr = requestErr
@@ -2260,9 +2287,21 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && resinMode {
 			// Park the exit that answered 429 before rotating: the next draw must
-			// not land on it again, and neither must the next request.
-			a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(resp))
-			a.noteResinLimited()
+			// not land on it again, and neither must the next request. The
+			// upstream limits per exit IP, so the park has to cover both
+			// identities; when the IP is still unknown the probe learns it and
+			// parks it as soon as it answers.
+			cooldown := resinAccountCooldownFor(resp)
+			a.coolResinAccount(resinRoute.lastAccount, cooldown)
+			if ip, known := a.resinExitIP(resinRoute.lastAccount); known {
+				a.coolResinExitIP(ip, cooldown)
+			} else {
+				a.learnResinExitIPAsync(resinRoute.lastAccount, cooldown)
+			}
+			if !limitedExitNoted {
+				a.noteResinLimited(resinRoute.lastAccount)
+				limitedExitNoted = true
+			}
 			limitedAttempts++
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
@@ -2272,7 +2311,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			// budget runs out — the intermediate 429s are ours to absorb — and
 			// only then relays the upstream's 429 so the caller can back off.
 			if i+1 < attempts && time.Since(start) < resinBudget {
-				attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
+				attemptSummary = append(attemptSummary, a.resinAttemptEntry(map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()}, resinRoute))
 				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 				_ = resp.Body.Close()
 				// A 429 request never waited at all before, so ten rotations ran
@@ -2320,7 +2359,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if copyErr != nil {
 			requestError = errors.Join(requestError, copyErr)
 		}
-		attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
+		attemptSummary = append(attemptSummary, a.resinAttemptEntry(map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()}, resinRoute))
 		a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, clientUserAgent, parsed.Stream, requestError)
 		traceSet(r, "status_code", resp.StatusCode)
 		traceSet(r, "attempts", i+1)

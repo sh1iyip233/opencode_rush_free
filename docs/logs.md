@@ -105,7 +105,7 @@ curl -s -H "X-Relay-Log-Key: $ADMIN_PASSWORD" \
 | `traffic` | 近 1 小时 5xx 占比 ≥ 10%（warn）/ ≥ 50%（error） |
 | `latency` | 近 1 小时平均延迟 > 30s |
 | `panics` | 24 小时内有 panic |
-| `proxy_pool` | 代理池里没有启用的出口 |
+| `proxy_pool` | 内置引擎下没有启用的出口（Resin 引擎自选账号，本地池为空属正常，不会报 warn） |
 | `client_keys` | 没有启用的客户端密钥 |
 | `models` | 没有可用模型 |
 | `maintenance` | 维护模式开启中 |

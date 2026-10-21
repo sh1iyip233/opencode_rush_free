@@ -322,6 +322,45 @@ func TestRecoverPanicIsLogged(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsProxyCheckKnowsTheEngine(t *testing.T) {
+	// Under the builtin engine an empty pool really is "no exit"; under Resin
+	// the pool is unused, so reporting it as a problem would be a false alarm.
+	cases := []struct {
+		name   string
+		engine string
+		want   string
+	}{
+		{"builtin without proxies", proxyEngineBuiltin, "warn"},
+		{"resin without proxies", proxyEngineResin, "ok"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := logApp(t)
+			if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", proxyEngineSettingKey, tc.engine); err != nil {
+				t.Fatalf("seed engine: %v", err)
+			}
+			h := logHandler(a)
+			rec := logDo(t, h, http.MethodGet, "/api/logs/diagnostics", "", map[string]string{logAPIKeyHeader: "test-password"})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("diagnostics = %d (%s)", rec.Code, rec.Body.String())
+			}
+			var diagnostics struct {
+				Checks []logCheck `json:"checks"`
+			}
+			logDecode(t, rec, &diagnostics)
+			for _, check := range diagnostics.Checks {
+				if check.ID == "proxy_pool" {
+					if check.Status != tc.want {
+						t.Fatalf("proxy_pool status = %q (%s), want %q", check.Status, check.Detail, tc.want)
+					}
+					return
+				}
+			}
+			t.Fatal("diagnostics did not report a proxy_pool check")
+		})
+	}
+}
+
 func TestLogNotesRoundTrip(t *testing.T) {
 	a := logApp(t)
 	h := logHandler(a)

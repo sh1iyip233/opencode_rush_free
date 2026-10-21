@@ -722,8 +722,15 @@ func (a *App) logsDiagnostics(w http.ResponseWriter, r *http.Request) {
 	_ = a.db.QueryRow("SELECT COUNT(*) FROM proxies WHERE enabled=1").Scan(&enabledProxies)
 	_ = a.db.QueryRow("SELECT COUNT(*) FROM client_keys WHERE enabled=1").Scan(&clientKeys)
 	_ = a.db.QueryRow("SELECT COUNT(*) FROM models").Scan(&modelCount)
-	if enabledProxies == 0 {
-		addCheck("proxy_pool", "warn", "no enabled proxies", "the router has no exit; requests fall back to a direct lane", enabledProxies)
+	// An empty proxy pool only means "no exit" under the builtin engine: Resin
+	// picks its own accounts, so the local pool is unused there and a warning
+	// would send a reader chasing a configuration that is correct.
+	engine, engineErr := settingValue(a.db, proxyEngineSettingKey)
+	engine = strings.TrimSpace(engine)
+	if engineErr == nil && engine == proxyEngineResin {
+		addCheck("proxy_pool", "ok", "Resin routing", "the Resin engine selects its own accounts; the local proxy pool is not used", enabledProxies)
+	} else if enabledProxies == 0 {
+		addCheck("proxy_pool", "warn", "no enabled proxies", "the builtin engine has no exit; requests fail with 503 until a proxy is enabled", enabledProxies)
 	} else {
 		addCheck("proxy_pool", "ok", "proxy pool populated", fmt.Sprintf("%d enabled proxies", enabledProxies), enabledProxies)
 	}

@@ -4,6 +4,7 @@ const consolePages = [
   { view: "overview", title: "仪表盘" },
   { view: "proxies", title: "代理池" },
   { view: "models", title: "模型与网关" },
+  { view: "compression", title: "压缩网关" },
   { view: "usage", title: "使用记录" },
   { view: "settings", title: "设置" },
 ] as const;
@@ -48,7 +49,7 @@ async function openConsolePage(page: Page, title: string, mobile: boolean) {
   }
 }
 
-test("1440x900 控制台五个页面保持统一结构", async ({ page }, testInfo) => {
+test("1440x900 控制台六个页面保持统一结构", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await login(page);
 
@@ -59,7 +60,7 @@ test("1440x900 控制台五个页面保持统一结构", async ({ page }, testIn
   }
 });
 
-test("390x844 抽屉和五个页面适配移动端", async ({ page }, testInfo) => {
+test("390x844 抽屉和六个页面适配移动端", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.route("**/api/usage/requests?**", async (route) => {
     const url = new URL(route.request().url());

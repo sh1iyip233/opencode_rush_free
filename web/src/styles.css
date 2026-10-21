@@ -1093,6 +1093,66 @@ textarea {
   gap: 12px;
 }
 
+.compression-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.compression-status-row code {
+  font-size: 10px;
+}
+
+.compression-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px 16px;
+  margin: 14px 0;
+}
+
+.compression-field {
+  display: grid;
+  gap: 7px;
+  margin-top: 14px;
+}
+
+.compression-field textarea {
+  min-height: 110px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--ink);
+  font: 11px/1.6 var(--data-font);
+  resize: vertical;
+}
+
+.compression-events {
+  display: grid;
+  margin-top: 14px;
+}
+
+.compression-event {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.compression-event code {
+  font-size: 11px;
+}
+
+.compression-event .error-line {
+  flex-basis: 100%;
+  margin: 0;
+}
+
 .vision-proxy-toggle {
   min-height: 48px;
   display: grid !important;

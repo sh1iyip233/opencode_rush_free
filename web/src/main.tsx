@@ -17,6 +17,7 @@ import {
   FilterX,
   ImageIcon,
   KeyRound,
+  Layers,
   LogOut,
   Menu,
   Network,
@@ -535,7 +536,7 @@ function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [page, setPage] = useState(() => {
     const view = new URLSearchParams(location.search).get("view");
-    return ["overview", "proxies", "models", "usage", "settings"].includes(view || "") ? view! : "overview";
+    return ["overview", "proxies", "models", "compression", "usage", "settings"].includes(view || "") ? view! : "overview";
   });
   const [toast, setToast] = useState<Toast | null>(null);
   useEffect(() => {
@@ -551,7 +552,7 @@ function App() {
   useEffect(() => {
     const syncPageFromURL = () => {
       const view = new URLSearchParams(location.search).get("view");
-      setPage(["overview", "proxies", "models", "usage", "settings"].includes(view || "") ? view! : "overview");
+      setPage(["overview", "proxies", "models", "compression", "usage", "settings"].includes(view || "") ? view! : "overview");
     };
     window.addEventListener("popstate", syncPageFromURL);
     return () => window.removeEventListener("popstate", syncPageFromURL);
@@ -691,6 +692,7 @@ function Console({
     ["overview", "仪表盘", "Overview", "网关、模型与路径的实时运行状态", CircleGauge],
     ["proxies", "代理池", "Proxy pool", "管理出口路径、路由策略与健康状态", Network],
     ["models", "模型与网关", "Models", "配置上游、免费模型与客户端访问", Database],
+    ["compression", "压缩网关", "Compression", "折叠较早对话、配置摘要 AI 接口", Layers],
     ["usage", "使用记录", "Usage log", "按时间、模型和结果审计每次调用", Activity],
     ["settings", "设置", "Settings", "管理安全、探测、告警与数据保留", Settings2],
   ] as const;
@@ -844,6 +846,9 @@ function Console({
             notify={notify}
             registerRefresh={registerRefresh}
           />
+        )}{" "}
+        {page === "compression" && (
+          <CompressionPage notify={notify} onLogout={onLogout} registerRefresh={registerRefresh} />
         )}{" "}
         {page === "usage" && (
           <Usage
@@ -2322,6 +2327,765 @@ function Models({
   );
 }
 
+type CompressionSettings = {
+  enabled: boolean;
+  api_style: string;
+  base_url: string;
+  model: string;
+  use_proxy: boolean;
+  trigger_ratio: number;
+  context_window: number;
+  keep_recent_messages: number;
+  min_fold_messages: number;
+  max_summary_tokens: number;
+  temperature: number;
+  timeout_seconds: number;
+  summary_role: string;
+  marker: string;
+  prompt: string;
+  fail_open: boolean;
+  has_api_key: boolean;
+  configured: boolean;
+  default_marker: string;
+  default_prompt: string;
+};
+
+type CompressionTestResult = {
+  ok: boolean;
+  summary?: string;
+  summary_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  latency_ms?: number;
+  api_style?: string;
+  model?: string;
+  endpoint?: string;
+  error?: string;
+};
+
+type CompressionEventRow = {
+  id: number;
+  created_at: string;
+  session_key: string;
+  model: string;
+  api_style: string;
+  summary_model: string;
+  folded_messages: number;
+  tokens_before: number;
+  tokens_after: number;
+  saved_tokens: number;
+  summary_tokens: number;
+  latency_ms: number;
+  status: string;
+  error_message: string;
+};
+
+type CompressionDailyStat = {
+  date: string;
+  compressions: number;
+  saved_tokens: number;
+  failures: number;
+};
+
+type CompressionStats = {
+  days: number;
+  compressions: number;
+  failures: number;
+  tokens_before: number;
+  tokens_after: number;
+  saved_tokens: number;
+  summary_tokens: number;
+  average_latency_ms: number;
+  sessions: number;
+  daily: CompressionDailyStat[];
+  recent: CompressionEventRow[];
+};
+
+type CompressionSessionRow = {
+  session_key: string;
+  model: string;
+  preview: string;
+  folded_messages: number;
+  folded_tokens: number;
+  compressions: number;
+  tokens_before: number;
+  tokens_after: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type CompressionPreview = {
+  applied: boolean;
+  reason?: string;
+  error?: string;
+  window?: number;
+  folded_messages?: number;
+  kept_messages?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  saved_tokens?: number;
+  summary?: string;
+  summary_tokens?: number;
+  latency_ms?: number;
+  tokens?: number;
+  summary_message?: unknown;
+  messages?: unknown;
+};
+
+const compressionSampleMessages = `[
+  {"role": "system", "content": "You are a coding agent working on the Relay Desk gateway."},
+  {"role": "user", "content": "给 gatewayChat 加压缩网关，压缩用的 AI API 要能自由配置。"},
+  {"role": "assistant", "content": "我会在 gatewayChat 里插入 applyCompression，并新增压缩网关设置页。"},
+  {"role": "user", "content": "记得补测试和文档。"},
+  {"role": "assistant", "content": "已补 compression_test.go 与 docs/compression.md。"},
+  {"role": "user", "content": "现在开始做管理台界面。"}
+]`;
+
+const compressionReasonText = (reason?: string) => {
+  switch (reason) {
+    case "below_threshold":
+      return "未达到触发阈值";
+    case "not_configured":
+      return "摘要接口未配置";
+    case "disabled":
+      return "压缩网关未启用";
+    case "client_disabled":
+      return "客户端要求关闭";
+    case "no_messages":
+      return "请求没有 messages";
+    case "settings_unavailable":
+      return "读取配置失败";
+    case "summarizer_failed":
+      return "摘要接口调用失败";
+    case "empty_delta":
+      return "没有新的可折叠内容";
+    default:
+      return reason || "未压缩";
+  }
+};
+
+function CompressionPage({
+  notify,
+  onLogout,
+  registerRefresh,
+}: {
+  notify: (value: string, type?: ToastType) => void;
+  onLogout: () => void;
+  registerRefresh: RegisterRefresh;
+}) {
+  const [draft, setDraft] = useState<CompressionSettings | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [testResult, setTestResult] = useState<CompressionTestResult | null>(null);
+  const [stats, setStats] = useState<CompressionStats | null>(null);
+  const [sessions, setSessions] = useState<CompressionSessionRow[]>([]);
+  const [sample, setSample] = useState(compressionSampleMessages);
+  const [preview, setPreview] = useState<CompressionPreview | null>(null);
+
+  const fail = useCallback(
+    (error: unknown) => {
+      if ((error as Error).message === "AUTH") onLogout();
+      else notify((error as Error).message, "error");
+    },
+    [notify, onLogout],
+  );
+
+  const loadSettings = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = (await api("/api/settings/compression")) as CompressionSettings;
+      setDraft(data);
+      setApiKey("");
+      return true;
+    } catch (error) {
+      fail(error);
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, [fail]);
+
+  const loadRuntime = useCallback(async () => {
+    try {
+      const [statsData, sessionData] = await Promise.all([
+        api("/api/compression/stats?days=7"),
+        api("/api/compression/sessions?limit=20"),
+      ]);
+      setStats(statsData as CompressionStats);
+      const rows = (sessionData as { sessions?: CompressionSessionRow[] }).sessions || [];
+      setSessions(rows);
+      return true;
+    } catch (error) {
+      fail(error);
+      return false;
+    }
+  }, [fail]);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
+  useEffect(() => {
+    void loadRuntime();
+  }, [loadRuntime]);
+  const refreshCompression = useCallback(async () => {
+    const results = await Promise.all([loadSettings(), loadRuntime()]);
+    return results.every(Boolean);
+  }, [loadSettings, loadRuntime]);
+  useEffect(
+    () => registerRefresh("compression", refreshCompression),
+    [refreshCompression, registerRefresh],
+  );
+
+  const update = (patch: Partial<CompressionSettings>) =>
+    setDraft((current) => (current ? { ...current, ...patch } : current));
+
+  const save = async () => {
+    if (!draft) return;
+    setSaving(true);
+    try {
+      const payload: Record<string, unknown> = {
+        enabled: draft.enabled,
+        api_style: draft.api_style,
+        base_url: draft.base_url,
+        model: draft.model,
+        use_proxy: draft.use_proxy,
+        trigger_ratio: draft.trigger_ratio,
+        context_window: draft.context_window,
+        keep_recent_messages: draft.keep_recent_messages,
+        min_fold_messages: draft.min_fold_messages,
+        max_summary_tokens: draft.max_summary_tokens,
+        temperature: draft.temperature,
+        timeout_seconds: draft.timeout_seconds,
+        summary_role: draft.summary_role,
+        marker: draft.marker,
+        prompt: draft.prompt,
+        fail_open: draft.fail_open,
+      };
+      if (apiKey.trim()) payload.api_key = apiKey.trim();
+      const data = (await api("/api/settings/compression", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      })) as CompressionSettings;
+      setDraft(data);
+      setApiKey("");
+      notify("压缩网关配置已保存");
+      void loadRuntime();
+    } catch (error) {
+      fail(error);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const runTest = async () => {
+    if (!draft) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const payload: Record<string, unknown> = {
+        base_url: draft.base_url,
+        model: draft.model,
+        api_style: draft.api_style,
+        use_proxy: draft.use_proxy,
+        timeout_seconds: draft.timeout_seconds,
+      };
+      if (apiKey.trim()) payload.api_key = apiKey.trim();
+      const data = (await api("/api/settings/compression/test", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      })) as CompressionTestResult;
+      setTestResult({ ...data, ok: true });
+      notify("摘要接口可用");
+    } catch (error) {
+      if ((error as Error).message === "AUTH") {
+        onLogout();
+      } else {
+        setTestResult({ ok: false, error: (error as Error).message });
+        notify("摘要接口测试失败", "error");
+      }
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const runPreview = async () => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(sample);
+    } catch {
+      notify("示例消息不是合法 JSON", "error");
+      return;
+    }
+    const messages = Array.isArray(parsed)
+      ? parsed
+      : (parsed as { messages?: unknown[] })?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      notify("示例消息需要是非空数组，或包含 messages 数组", "error");
+      return;
+    }
+    setPreviewing(true);
+    setPreview(null);
+    try {
+      const data = (await api("/api/compression/preview", {
+        method: "POST",
+        body: JSON.stringify({ model: "preview-model", messages, force: true }),
+      })) as CompressionPreview;
+      setPreview(data);
+      if (data.applied) notify("预览已生成");
+      else notify(compressionReasonText(data.reason), "warning");
+    } catch (error) {
+      fail(error);
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const removeSession = async (key: string) => {
+    if (!confirm(`删除会话「${key}」的压缩摘要？下一轮会重新压缩。`)) return;
+    try {
+      await api(`/api/compression/sessions/${encodeURIComponent(key)}`, { method: "DELETE" });
+      notify("会话摘要已删除");
+      void loadRuntime();
+    } catch (error) {
+      fail(error);
+    }
+  };
+
+  const resetSessions = async () => {
+    if (!confirm("清空所有会话的压缩摘要？")) return;
+    try {
+      await api("/api/compression/sessions/reset", { method: "POST" });
+      notify("已清空全部会话摘要");
+      void loadRuntime();
+    } catch (error) {
+      fail(error);
+    }
+  };
+
+  const stamp = (raw: string) => (raw ? new Date(raw).toLocaleString("zh-CN") : "—");
+
+  return (
+    <div className="page">
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">CONTEXT COMPRESSION</span>
+            <h3>摘要接口与折叠策略</h3>
+            <p className="muted">
+              会话接近模型上下文上限时，把较早的对话折叠成一份自包含摘要；摘要由你配置的 AI API 生成，
+              可以指向任意 OpenAI 兼容或 Anthropic Messages 接口。
+            </p>
+          </div>
+          <Layers size={20} />
+        </div>
+        {loading && !draft && <p className="muted">正在加载压缩网关配置…</p>}
+        {draft && (
+          <>
+            <div className="compression-status-row">
+              <span className={draft.enabled ? "status-tag" : "status-tag muted-tag"}>
+                {draft.enabled ? "已启用" : "未启用"}
+              </span>
+              <span className={draft.configured ? "status-tag" : "status-tag muted-tag"}>
+                {draft.configured ? "摘要接口已配置" : "摘要接口未配置"}
+              </span>
+              <span className="muted small">
+                摘要请求单独记账（<code>compression</code>），不计入聊天仪表盘。
+              </span>
+            </div>
+            <label className="vision-proxy-toggle">
+              <input
+                type="checkbox"
+                checked={draft.enabled}
+                onChange={(e) => update({ enabled: e.target.checked })}
+              />
+              <span>
+                <b>启用压缩网关</b>
+                <small>
+                  {draft.enabled
+                    ? "超过触发比例时自动折叠较早消息。"
+                    : "关闭时请求原样转发，配置保留。"}
+                </small>
+              </span>
+            </label>
+            <div className="compression-grid">
+              <label>
+                接口风格
+                <select
+                  value={draft.api_style}
+                  onChange={(e) => update({ api_style: e.target.value })}
+                >
+                  <option value="openai">OpenAI 兼容 (/chat/completions)</option>
+                  <option value="anthropic">Anthropic Messages (/messages)</option>
+                </select>
+              </label>
+              <label>
+                摘要 Base URL
+                <input
+                  value={draft.base_url}
+                  onChange={(e) => update({ base_url: e.target.value })}
+                  placeholder="https://api.example.com"
+                />
+              </label>
+              <label>
+                摘要模型
+                <input
+                  value={draft.model}
+                  onChange={(e) => update({ model: e.target.value })}
+                  placeholder="gpt-4o-mini / claude-3-5-haiku-latest"
+                />
+              </label>
+              <label>
+                摘要 API Key
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder={draft.has_api_key ? "已保存 · 留空保持不变" : "输入摘要接口 API Key"}
+                />
+              </label>
+              <label>
+                最大摘要 tokens
+                <input
+                  type="number"
+                  min={128}
+                  max={16000}
+                  value={draft.max_summary_tokens}
+                  onChange={(e) => update({ max_summary_tokens: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                温度
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={2}
+                  value={draft.temperature}
+                  onChange={(e) => update({ temperature: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                超时（秒）
+                <input
+                  type="number"
+                  min={5}
+                  max={600}
+                  value={draft.timeout_seconds}
+                  onChange={(e) => update({ timeout_seconds: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                摘要消息角色
+                <select
+                  value={draft.summary_role}
+                  onChange={(e) => update({ summary_role: e.target.value })}
+                >
+                  <option value="system">system</option>
+                  <option value="user">user</option>
+                </select>
+              </label>
+            </div>
+            <label className="vision-proxy-toggle">
+              <input
+                type="checkbox"
+                checked={draft.use_proxy}
+                onChange={(e) => update({ use_proxy: e.target.checked })}
+              />
+              <span>
+                <b>摘要请求走代理池</b>
+                <small>
+                  {draft.use_proxy
+                    ? "摘要请求通过当前选中的出口发送。"
+                    : "摘要请求直连供应商；主模型请求仍使用代理池。"}
+                </small>
+              </span>
+            </label>
+            <div className="compression-grid">
+              <label>
+                触发比例
+                <input
+                  type="number"
+                  step="0.05"
+                  min={0.3}
+                  max={0.95}
+                  value={draft.trigger_ratio}
+                  onChange={(e) => update({ trigger_ratio: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                上下文窗口（tokens）
+                <input
+                  type="number"
+                  min={2000}
+                  value={draft.context_window}
+                  onChange={(e) => update({ context_window: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                保留最近消息数
+                <input
+                  type="number"
+                  min={2}
+                  max={500}
+                  value={draft.keep_recent_messages}
+                  onChange={(e) => update({ keep_recent_messages: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                最少折叠消息数
+                <input
+                  type="number"
+                  min={1}
+                  max={500}
+                  value={draft.min_fold_messages}
+                  onChange={(e) => update({ min_fold_messages: Number(e.target.value) })}
+                />
+              </label>
+            </div>
+            <label className="vision-proxy-toggle">
+              <input
+                type="checkbox"
+                checked={draft.fail_open}
+                onChange={(e) => update({ fail_open: e.target.checked })}
+              />
+              <span>
+                <b>摘要失败时放行</b>
+                <small>
+                  {draft.fail_open
+                    ? "摘要接口报错时原样转发请求，只在响应头标记 failed。"
+                    : "摘要接口报错时直接返回 502，避免超长请求打到上游。"}
+                </small>
+              </span>
+            </label>
+            <label className="compression-field">
+              摘要标记
+              <input
+                value={draft.marker}
+                onChange={(e) => update({ marker: e.target.value })}
+                placeholder={draft.default_marker}
+              />
+            </label>
+            <label className="compression-field">
+              压缩提示词
+              <textarea
+                rows={6}
+                value={draft.prompt}
+                onChange={(e) => update({ prompt: e.target.value })}
+                placeholder={draft.default_prompt}
+              />
+            </label>
+            <div className="config-actions">
+              <button className="secondary" onClick={() => void save()} disabled={saving}>
+                保存配置
+              </button>
+              <button className="secondary" onClick={() => void runTest()} disabled={testing}>
+                测试摘要接口
+              </button>
+              <button
+                className="text-btn"
+                type="button"
+                onClick={() =>
+                  update({ marker: draft.default_marker, prompt: draft.default_prompt })
+                }
+              >
+                恢复默认提示词
+                <ArrowUpRight size={14} />
+              </button>
+            </div>
+            {testResult && (
+              <div className={`test-result ${testResult.ok ? "ok" : "bad"}`}>
+                {testResult.ok ? (
+                  <>
+                    <b>
+                      接口可用 · {testResult.model || draft.model} · {testResult.latency_ms ?? 0} ms
+                    </b>
+                    <span>
+                      端点 {testResult.endpoint || "—"} · tokens{" "}
+                      {fmt(testResult.prompt_tokens || 0)} + {fmt(testResult.completion_tokens || 0)}
+                    </span>
+                    <span>摘要预览：{testResult.summary}</span>
+                  </>
+                ) : (
+                  <b>测试失败：{testResult.error}</b>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">LAST 7 DAYS</span>
+            <h3>压缩运行统计</h3>
+            <p className="muted">统计来自 compression_events 与 compression_sessions 两张表。</p>
+          </div>
+          <Activity size={20} />
+        </div>
+        <div className="stat-grid">
+          <div className="stat">
+            <div className="stat-top">
+              <span>COMPRESSIONS</span>
+              <span className="stat-accent" style={{ color: "var(--accent)" }}>
+                <Layers size={14} />
+              </span>
+            </div>
+            <strong>{fmt(stats?.compressions || 0)}</strong>
+            <small>近 {stats?.days ?? 7} 天折叠次数</small>
+          </div>
+          <div className="stat">
+            <div className="stat-top">
+              <span>SAVED TOKENS</span>
+              <span className="stat-accent" style={{ color: "var(--success)" }}>
+                <ChevronDown size={14} />
+              </span>
+            </div>
+            <strong>{fmt(stats?.saved_tokens || 0)}</strong>
+            <small>折叠后净节省 tokens</small>
+          </div>
+          <div className="stat">
+            <div className="stat-top">
+              <span>FAILURES</span>
+              <span className="stat-accent" style={{ color: "var(--error)" }}>
+                <TriangleAlert size={14} />
+              </span>
+            </div>
+            <strong>{fmt(stats?.failures || 0)}</strong>
+            <small>摘要接口失败次数</small>
+          </div>
+          <div className="stat">
+            <div className="stat-top">
+              <span>SESSIONS</span>
+              <span className="stat-accent" style={{ color: "var(--muted)" }}>
+                <Database size={14} />
+              </span>
+            </div>
+            <strong>{fmt(stats?.sessions || 0)}</strong>
+            <small>持有摘要的会话数</small>
+          </div>
+        </div>
+        {stats && stats.recent.length > 0 ? (
+          <div className="compression-events">
+            {stats.recent.map((event) => (
+              <div className="compression-event" key={event.id}>
+                <span className={event.status === "success" ? "status-tag" : "status-tag muted-tag"}>
+                  {event.status === "success" ? "成功" : "失败"}
+                </span>
+                <code>{event.session_key}</code>
+                <span>
+                  {event.folded_messages} 条 · {fmt(event.tokens_before)} → {fmt(event.tokens_after)}
+                </span>
+                <span className="muted">{event.summary_model || "—"}</span>
+                <span className="muted">{event.latency_ms} ms</span>
+                <span className="muted">{stamp(event.created_at)}</span>
+                {event.error_message && <span className="error-line">{event.error_message}</span>}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Empty text="还没有压缩记录" />
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">SESSION SUMMARIES</span>
+            <h3>会话摘要</h3>
+            <p className="muted">每个会话保留一份增量摘要；删除后下一轮会重新压缩。</p>
+          </div>
+          <button className="text-btn" type="button" onClick={() => void resetSessions()}>
+            清空全部
+            <Trash2 size={14} />
+          </button>
+        </div>
+        {sessions.length > 0 ? (
+          <div className="key-list">
+            {sessions.map((session) => (
+              <div className="key-row" key={session.session_key}>
+                <code>{session.session_key}</code>
+                <span className="muted">{session.model || "—"}</span>
+                <span>
+                  {session.folded_messages} 条 · {fmt(session.folded_tokens)} tokens ·{" "}
+                  {session.compressions} 次
+                </span>
+                <span className="muted">{stamp(session.updated_at)}</span>
+                <button
+                  className="icon-btn"
+                  type="button"
+                  title="删除该会话摘要"
+                  aria-label="删除该会话摘要"
+                  onClick={() => void removeSession(session.session_key)}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Empty text="还没有会话摘要" />
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">DRY RUN</span>
+            <h3>压缩预览</h3>
+            <p className="muted">
+              用示例消息验证折叠效果：预览使用已保存的摘要接口配置，不写入会话与统计。
+            </p>
+          </div>
+          <Eye size={20} />
+        </div>
+        <label className="compression-field">
+          示例消息（JSON 数组）
+          <textarea
+            rows={8}
+            value={sample}
+            onChange={(e) => setSample(e.target.value)}
+            spellCheck={false}
+          />
+        </label>
+        <div className="config-actions">
+          <button className="secondary" onClick={() => void runPreview()} disabled={previewing}>
+            预览压缩
+          </button>
+          <button className="text-btn" type="button" onClick={() => setSample(compressionSampleMessages)}>
+            重置示例
+          </button>
+        </div>
+        {preview && (
+          <div className={`test-result ${preview.applied ? "ok" : "bad"}`}>
+            {preview.applied ? (
+              <>
+                <b>
+                  已折叠 {preview.folded_messages} 条 · 保留 {preview.kept_messages} 条 ·{" "}
+                  {fmt(preview.tokens_before || 0)} → {fmt(preview.tokens_after || 0)} tokens
+                </b>
+                <span>
+                  节省 {fmt(preview.saved_tokens || 0)} tokens · 摘要{" "}
+                  {fmt(preview.summary_tokens || 0)} tokens · {preview.latency_ms ?? 0} ms
+                </span>
+                <span>摘要：{preview.summary}</span>
+              </>
+            ) : (
+              <b>
+                {preview.error
+                  ? `预览失败：${preview.error}`
+                  : `未折叠：${compressionReasonText(preview.reason)}（当前 ${fmt(
+                      preview.tokens || 0,
+                    )} tokens，窗口 ${fmt(preview.window || 0)}）`}
+              </b>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function PasswordCard({ notify }: { notify: (v: string, type?: ToastType) => void }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -3112,7 +3876,7 @@ function Empty({ text }: { text: string }) {
   );
 }
 export default App;
-export { ClientKeysPanel, Models, Proxies, Usage };
+export { ClientKeysPanel, CompressionPage, Models, Proxies, Usage };
 
 const root = document.getElementById("root");
 if (root) createRoot(root).render(<App />);

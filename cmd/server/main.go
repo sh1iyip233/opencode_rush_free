@@ -90,6 +90,19 @@ const (
 	// as-is, so a caller is never made to wait for a chain of retries that the
 	// gateway itself has already given up on.
 	gatewayRetryBudget = 25 * time.Second
+	// resinAttemptFloor is the least remaining budget worth spending on another
+	// attempt. Below it the next round trip cannot finish inside the budget the
+	// operator configured, so starting one only replaces a clean answer with a
+	// timeout: the caller waits for a dial it was never going to get an answer
+	// from. Measured against production, a single attempt costs 3-13s.
+	resinAttemptFloor = 3 * time.Second
+	// resinAttemptCeiling caps the header phase of one attempt. The upstream
+	// buffers a whole completion before its first byte arrives, so a healthy
+	// attempt legitimately needs up to ~38s; this sits above that and so never
+	// truncates an answer that was going to arrive. It only matters when the
+	// budget is configured larger, where without it one stalled exit could hold
+	// the caller for the transport's 120s header timeout.
+	resinAttemptCeiling = 45 * time.Second
 )
 
 var (
@@ -1956,6 +1969,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	var downstreamErr error
 	lastProxyURI := ""
 	retryCount := 0
+	// attemptsMade and limitedAttempts describe the chain that actually ran, not
+	// the one that was planned. retryCount alone cannot answer "was this caller
+	// rate limited or was the gateway broken?", because the loop also leaves
+	// early, so the terminal answer is derived from these.
+	attemptsMade := 0
+	limitedAttempts := 0
 	used := map[int64]struct{}{}
 	// A ban is a refusal of one exit and model pairing, not of the exit, so the
 	// banned set is loaded per request and only used to order candidates.
@@ -1991,6 +2010,22 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			lastErr = requestErr
 			break
 		}
+		// The header phase is bounded by whichever is smaller: what is left of the
+		// retry budget, or one attempt's ceiling. The budget bound is what keeps a
+		// chain from outliving the time the operator promised — a 45s budget
+		// produced 63s requests when a final attempt was allowed to run past it.
+		// The ceiling only binds when the budget is configured larger, and stops a
+		// single stalled exit from hanging for the transport's 120s header
+		// timeout. It covers headers only, so a generation that has started
+		// answering still streams to completion instead of being cut mid-answer.
+		headerDeadline := time.Duration(0)
+		if resinMode {
+			remaining := resinBudget - time.Since(start)
+			if remaining < resinAttemptFloor {
+				break
+			}
+			headerDeadline = resinHeaderDeadline(remaining)
+		}
 		var p ProxyRecord
 		if resinMode {
 			p, err = resinRoute.proxy(a, engineConfig)
@@ -2011,6 +2046,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			used[p.ID] = struct{}{}
 		}
 		retryCount = i
+		attemptsMade = i + 1
 		lastProxyURI = p.URI
 		traceNote(r, "attempt %d/%d engine=%s proxy=%s", i+1, attempts, routeEngine, redactProxyURI(p.URI))
 		bodyToForward := forwardBody
@@ -2136,7 +2172,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
-		resp, e := a.forward(r, bodyToForward, cfg, p, laneSession)
+		resp, e := a.forwardWithHeaderDeadline(r, bodyToForward, cfg, p, laneSession, headerDeadline)
 		if e != nil {
 			lastErr = e
 			traceNote(r, "attempt %d transport error: %s", i+1, truncateError(e.Error()))
@@ -2144,6 +2180,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			if requestErr := r.Context().Err(); requestErr != nil {
 				downstreamErr = requestErr
 				lastErr = requestErr
+				break
+			}
+			// Our own header deadline firing on a spent budget is not an exit
+			// fault: end the chain here rather than charging the account for a
+			// timeout the gateway imposed on it.
+			if errors.Is(e, context.DeadlineExceeded) && time.Since(start) >= resinBudget {
 				break
 			}
 			if resinMode {
@@ -2156,7 +2198,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				if advanceErr := resinRoute.advance(a); advanceErr != nil {
 					log.Printf("advance Resin account failed: %v", advanceErr)
 				}
-				if i+1 >= attempts || time.Since(start) >= gatewayRetryBudget {
+				// The same budget the 429 branch honours. Reading the generic
+				// 25s default here gave one request two different budgets
+				// depending on which failure kind it happened to meet.
+				if i+1 >= attempts || time.Since(start) >= resinBudget {
 					break
 				}
 				if !waitForRetry(r.Context(), retryAfterDelay(nil, i)) {
@@ -2218,6 +2263,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			// not land on it again, and neither must the next request.
 			a.coolResinAccount(resinRoute.lastAccount, resinAccountCooldownFor(resp))
 			a.noteResinLimited()
+			limitedAttempts++
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}
@@ -2287,11 +2333,21 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lastErr, finalStatus, origin := terminalGatewayFailure(downstreamErr, lastErr)
+	if downstreamErr == nil && resinMode {
+		if status, answerOrigin, waitSeconds, ok := terminalResinAnswer(limitedAttempts, attemptsMade, a.resinBreakerRemaining()); ok {
+			finalStatus, origin = status, answerOrigin
+			w.Header().Set("Retry-After", strconv.Itoa(waitSeconds))
+		}
+	}
 	a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", finalStatus, time.Since(start), nil, retryCount, nil, attemptSummary, clientUserAgent, parsed.Stream, lastErr, origin)
 	traceSet(r, "stage", "all_proxies_failed")
-	traceSet(r, "attempts", retryCount+1)
+	traceSet(r, "attempts", attemptsMade)
 	traceSet(r, "error_origin", origin)
 	traceSet(r, "error", lastErrString(lastErr))
+	if finalStatus == http.StatusTooManyRequests {
+		writeJSON(w, finalStatus, map[string]string{"error": "upstream rate limited", "detail": "every exit the gateway tried answered 429; retry after the cooldown"})
+		return
+	}
 	writeJSON(w, finalStatus, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
 }
 
@@ -2326,17 +2382,117 @@ func lastErrString(e error) string {
 	}
 	return e.Error()
 }
+
+// mostlyLimited reports whether a failed chain was dominated by upstream 429s
+// rather than by broken links. A pool that answered 429 on most attempts is rate
+// limited, not down, and the two deserve different answers.
+func mostlyLimited(limited, attempts int) bool {
+	return attempts > 0 && limited*2 >= attempts
+}
+
+// terminalResinAnswer upgrades a failed Resin chain to 429 when it was dominated
+// by upstream limits. Every observed production failure ended on a transport
+// error even when most of its attempts were 429s, so the caller was told the
+// gateway was broken when the pool was merely saturated: it went looking for an
+// outage that was not there and skipped the backoff the 429 asked for. The wait
+// comes from the breaker when it is open, and is never shorter than a retry the
+// pool would immediately limit again.
+func terminalResinAnswer(limited, attempts int, wait time.Duration) (status int, origin string, waitSeconds int, ok bool) {
+	if !mostlyLimited(limited, attempts) {
+		return 0, "", 0, false
+	}
+	waitSeconds = int(wait.Round(time.Second) / time.Second)
+	if waitSeconds < 5 {
+		waitSeconds = 5
+	}
+	return http.StatusTooManyRequests, "upstream", waitSeconds, true
+}
+
 func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, session string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), bytes.NewReader(body))
+	return a.forwardWithHeaderDeadline(r, body, cfg, p, session, 0)
+}
+
+// resinHeaderDeadline returns how long one attempt may wait for response
+// headers: whatever is left of the retry budget, capped by the per-attempt
+// ceiling. The budget term is what keeps a chain inside the time the operator
+// configured; the ceiling term only binds when the budget is larger than one
+// attempt could usefully take.
+func resinHeaderDeadline(remaining time.Duration) time.Duration {
+	if remaining > resinAttemptCeiling {
+		return resinAttemptCeiling
+	}
+	return remaining
+}
+
+// forwardWithHeaderDeadline sends one attempt and cuts only its header phase at
+// headerDeadline. Once the headers arrive the timer is disarmed and the body
+// keeps its own cancel handle, so a slow generation that fits the budget still
+// streams to completion. A plain context.WithTimeout is wrong here for exactly
+// that reason: it would truncate a healthy answer mid-flight.
+func (a *App) forwardWithHeaderDeadline(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, session string, headerDeadline time.Duration) (*http.Response, error) {
+	ctx, cancel := context.WithCancel(r.Context())
+	var timedOut atomic.Bool
+	var timer *time.Timer
+	if headerDeadline > 0 {
+		timer = time.AfterFunc(headerDeadline, func() {
+			timedOut.Store(true)
+			cancel()
+		})
+	}
+	stopTimer := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), bytes.NewReader(body))
 	if err != nil {
+		stopTimer()
+		cancel()
 		return nil, err
 	}
 	applyLaneHeaders(req, session)
 	client, err := a.httpClient(p)
 	if err != nil {
+		stopTimer()
+		cancel()
 		return nil, err
 	}
-	return client.Do(req)
+	resp, err := client.Do(req)
+	stopTimer()
+	deadlineErr := func() error {
+		return fmt.Errorf("upstream sent no response headers within %s: %w", headerDeadline, context.DeadlineExceeded)
+	}
+	if err != nil {
+		cancel()
+		// Report our own deadline as a timeout, not as whatever the transport
+		// made of the cancellation it observed.
+		if timedOut.Load() && r.Context().Err() == nil {
+			return nil, deadlineErr()
+		}
+		return nil, err
+	}
+	if timedOut.Load() {
+		// The timer fired in the window between the headers arriving and the
+		// stop above, so the body is already dead. Do not hand it back.
+		_ = resp.Body.Close()
+		cancel()
+		return nil, deadlineErr()
+	}
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// cancelOnCloseBody releases an attempt's cancel handle when its body is closed,
+// so an abandoned attempt cannot leak the context it was given.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // forwardVision sends the image-description request to the operator's own
